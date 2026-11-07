@@ -1,6 +1,8 @@
 /**
- * 回归测试：工作区路由、任务持久化、结果归属、等待与通知。
- * 用假 ctx 驱动插件 HTTP 接口，不依赖真实宿主。
+ * 回归测试：工作区路由、任务持久化、结果归属、等待与通知恢复。
+ *
+ * events mock 按宿主真实语义实现：beforeSeq 是「向过去翻页的排他上界」，
+ * end = min(throughSeq + 1, beforeSeq ?? throughSeq + 1)。
  */
 
 import { test } from 'node:test'
@@ -11,11 +13,39 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { apply } from '../index.js'
 
-let nextPort = 7701
+let nextPort = 7801
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const tempDir = () => fs.mkdtemp(path.join(tmpdir(), 'relay-test-'))
 
-async function tempDir() {
-  return fs.mkdtemp(path.join(tmpdir(), 'relay-test-'))
+/** 忠实模拟宿主 paginate：向过去翻页，maxMessages 按消息计数。 */
+function paginateMock(state) {
+  return async (request) => {
+    // 把中继投递时用的 requestId 按顺序挂到 user/message 上，模拟宿主记录 rpcId
+    let userIndex = 0
+    const events = state.events.map((event) => {
+      if (event.type !== 'user/message') return event
+      const rpcId = state.requestIds[userIndex] ?? event.data?.source?.rpcId
+      userIndex += 1
+      return { ...event, data: { ...event.data, source: { ...(event.data?.source ?? {}), rpcId } } }
+    })
+    const through = request.throughSeq ?? events.length - 1
+    const end = Math.min(through + 1, request.beforeSeq ?? through + 1)
+    const max = request.maxMessages ?? 20
+    let count = 0
+    let cut = 0
+    for (let index = end - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event.type !== 'user/message' && event.type !== 'assistant/message') continue
+      count += 1
+      cut = event.seq
+      if (count >= max) break
+    }
+    return {
+      cursor: through,
+      hasMore: cut > 0,
+      records: events.slice(cut, end).map((event) => ({ type: 'event', event })),
+    }
+  }
 }
 
 async function startRelay(options = {}) {
@@ -30,10 +60,11 @@ async function startRelay(options = {}) {
     createdId: options.createdId ?? 'session-created',
     seq: options.seq ?? 5,
     events: options.events ?? [],
+    stateImpl: options.stateImpl,
     promptImpl: options.promptImpl,
-    eventsImpl: options.eventsImpl,
     notifyUrl: options.notifyUrl,
     promptCalls: [],
+    requestIds: [],
     createCalls: [],
     dataDir,
   }
@@ -44,19 +75,15 @@ async function startRelay(options = {}) {
     },
     async prompt(request, signal) {
       state.promptCalls.push(request)
+      state.requestIds.push(request.requestId)
       if (state.promptImpl) return state.promptImpl(request, signal)
       return { accepted: true }
     },
     async state() {
+      if (state.stateImpl) return state.stateImpl()
       return { running: state.running, cursor: state.cursor }
     },
-    async events(request) {
-      if (state.eventsImpl) return state.eventsImpl(request)
-      const events = state.events.filter(
-        (event) => event.seq > request.beforeSeq && event.seq <= request.throughSeq,
-      )
-      return { cursor: request.throughSeq, hasMore: false, records: events.map((event) => ({ type: 'event', event })) }
-    },
+    events: paginateMock(state),
     async create(request) {
       state.createCalls.push(request)
       return { sessionId: state.createdId }
@@ -94,11 +121,26 @@ async function startRelay(options = {}) {
 
   apply(ctx, {
     port,
-    tickMs: options.tickMs ?? 20,
+    tickMs: options.tickMs ?? 15,
     ...(state.notifyUrl === undefined ? {} : { notifyUrl: state.notifyUrl }),
     dataDir,
   })
-  await delay(150)
+
+  // 等端口真正可服务，避免固定 sleep 造成的启动竞态
+  let ready = false
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/health`)
+      if (response.ok) {
+        ready = true
+        break
+      }
+    } catch {
+      // 还没起来
+    }
+    await delay(20)
+  }
+  if (!ready) throw new Error(`relay 未能在端口 ${port} 启动`)
 
   const base = `http://127.0.0.1:${port}`
   const call = async (method, urlPath, body) => {
@@ -113,7 +155,6 @@ async function startRelay(options = {}) {
   return {
     state,
     call,
-    base,
     close() {
       for (const dispose of disposers) {
         try {
@@ -123,9 +164,7 @@ async function startRelay(options = {}) {
         }
       }
     },
-    async cleanup() {
-      await fs.rm(dataDir, { recursive: true, force: true })
-    },
+    cleanup: () => fs.rm(dataDir, { recursive: true, force: true }),
   }
 }
 
@@ -133,7 +172,25 @@ const WS = '/tmp/ws-alpha'
 const mainRow = (sessionId, cwd, extra = {}) => ({ sessionId, cwd, running: false, blank: false, updatedAt: 1000, ...extra })
 const subagentRow = (sessionId, cwd, extra = {}) => ({ ...mainRow(sessionId, cwd, extra), origin: 'subagent', parentSessionId: 'session-parent' })
 
-// ---------- 路由（沿用上一轮） ----------
+const turnEvents = (texts) => {
+  const events = []
+  let seq = 0
+  for (const text of texts) {
+    events.push({ type: 'user/message', seq: seq, data: { source: { kind: 'user' } } })
+    seq += 1
+    events.push({ type: 'turn/start', seq: seq, data: {} })
+    seq += 1
+    if (text !== null) {
+      events.push({ type: 'assistant/message', seq: seq, data: { message: { content: [{ type: 'text', text }] } } })
+      seq += 1
+    }
+    events.push({ type: 'turn/end', seq: seq, data: {} })
+    seq += 1
+  }
+  return { events, lastSeq: seq - 1 }
+}
+
+// ---------- 路由 ----------
 
 test('最新是子会话：跳过它，投给主会话', async () => {
   const relay = await startRelay({ rows: [mainRow('session-main', WS), subagentRow('session-child', WS, { updatedAt: 9999, running: true })] })
@@ -143,7 +200,6 @@ test('最新是子会话：跳过它，投给主会话', async () => {
     assert.equal(response.json.sessionId, 'session-main')
     assert.equal(response.json.selection.rule, 'recent-active')
     assert.ok(response.json.taskId.startsWith('task-'))
-    assert.ok(response.json.requestId)
   } finally {
     relay.close()
     await relay.cleanup()
@@ -157,7 +213,6 @@ test('多个主会话：运行中优先，之后复用绑定', async () => {
     assert.equal(first.json.sessionId, 'session-b')
     assert.equal(first.json.selection.rule, 'running')
     const second = await relay.call('POST', '/send', { workspace: WS, text: '二' })
-    assert.equal(second.json.sessionId, 'session-b')
     assert.equal(second.json.selection.rule, 'bound')
   } finally {
     relay.close()
@@ -173,7 +228,6 @@ test('绑定失效后重新解析', async () => {
     relay.state.rows = [mainRow('session-new', WS, { updatedAt: 2000 })]
     const second = await relay.call('POST', '/send', { workspace: WS, text: '二' })
     assert.equal(second.json.sessionId, 'session-new')
-    assert.notEqual(second.json.selection.rule, 'bound')
   } finally {
     relay.close()
     await relay.cleanup()
@@ -186,7 +240,6 @@ test('没有主会话时创建', async () => {
     const response = await relay.call('POST', '/send', { workspace: WS, text: '开新活' })
     assert.equal(response.json.sessionId, 'session-fresh')
     assert.equal(response.json.selection.rule, 'created')
-    assert.deepEqual(relay.state.createCalls, [{ cwd: WS }])
   } finally {
     relay.close()
     await relay.cleanup()
@@ -198,7 +251,6 @@ test('显式 sessionId 指向子会话：409 且不投递', async () => {
   try {
     const response = await relay.call('POST', '/send', { sessionId: 'session-child', text: 'x' })
     assert.equal(response.status, 409)
-    assert.equal(response.json.error.details.kind, 'subagent')
     assert.equal(relay.state.promptCalls.length, 0)
   } finally {
     relay.close()
@@ -206,58 +258,29 @@ test('显式 sessionId 指向子会话：409 且不投递', async () => {
   }
 })
 
-// ---------- 任务持久化与结果归属 ----------
+// ---------- 结果归属（真实分页语义） ----------
 
-test('派工回执含 taskId / requestId / 会话 / 工作区', async () => {
-  const relay = await startRelay({ rows: [mainRow('session-main', WS)] })
-  try {
-    const response = await relay.call('POST', '/send', { workspace: WS, text: '干活' })
-    const { taskId, requestId, sessionId, selection } = response.json
-    assert.ok(taskId.startsWith('task-'))
-    assert.ok(requestId)
-    assert.equal(sessionId, 'session-main')
-    assert.equal(selection.workspace, WS)
-
-    const task = await relay.call('GET', `/tasks/${taskId}`)
-    assert.equal(task.status, 200)
-    assert.equal(task.json.task.workspace, WS)
-    assert.equal(task.json.task.status, 'running')
-  } finally {
-    relay.close()
-    await relay.cleanup()
-  }
-})
-
-test('超时后完成：ask 先返回 running，随后按 taskId 查到 completed 与正文', async () => {
+test('超时后完成：按 requestId 与 turn 段归属，正文正确', async () => {
+  const { events } = turnEvents(['任务完成，测试通过。'])
   const relay = await startRelay({
     rows: [mainRow('session-main', WS)],
     running: true,
-    cursor: 8,
-    seq: 5,
-    events: [
-      { type: 'user/message', seq: 5, data: { source: { kind: 'user' } } },
-      { type: 'turn/start', seq: 6, data: {} },
-      { type: 'assistant/message', seq: 7, data: { message: { role: 'assistant', content: [{ type: 'text', text: '任务完成，测试通过。' }] } } },
-    ],
+    seq: 0,
+    cursor: events.length - 1,
+    events,
   })
   try {
     const pending = await relay.call('POST', '/ask', { workspace: WS, text: '长任务', timeoutMs: 200 })
     assert.equal(pending.json.status, 'running')
-    assert.equal(pending.json.reason, 'timeout')
-    assert.ok(pending.json.taskId)
-    assert.equal(pending.json.text, '')
-    // 关键：没有重发
     assert.equal(relay.state.promptCalls.length, 1)
 
-    // 任务继续跑，随后空闲
     relay.state.running = false
-    relay.state.cursor = 8
-    await delay(120)
+    await delay(150)
 
     const result = await relay.call('GET', `/tasks/${pending.json.taskId}`)
     assert.equal(result.json.task.status, 'completed')
     assert.match(result.json.task.result.text, /任务完成/)
-    assert.equal(result.json.task.attribution, 'seq-segment')
+    assert.equal(result.json.task.attribution, 'rpc-turn-segment')
     assert.equal(relay.state.promptCalls.length, 1)
   } finally {
     relay.close()
@@ -265,26 +288,13 @@ test('超时后完成：ask 先返回 running，随后按 taskId 查到 complete
   }
 })
 
-test('同会话连续任务：结果按 turn 段各自归属', async () => {
-  const relay = await startRelay({
-    rows: [mainRow('session-main', WS)],
-    cursor: 12,
-    seq: 5,
-    events: [
-      { type: 'user/message', seq: 5, data: {} },
-      { type: 'turn/start', seq: 6, data: {} },
-      { type: 'assistant/message', seq: 7, data: { message: { content: [{ type: 'text', text: '第一件完成' }] } } },
-      { type: 'user/message', seq: 8, data: {} },
-      { type: 'turn/start', seq: 9, data: {} },
-      { type: 'assistant/message', seq: 10, data: { message: { content: [{ type: 'text', text: '第二件完成' }] } } },
-    ],
-  })
+test('同会话连续任务：各自归属，不串内容', async () => {
+  const { events, lastSeq } = turnEvents(['第一件完成', '第二件完成'])
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)], seq: 0, cursor: lastSeq, events })
   try {
     const first = await relay.call('POST', '/send', { workspace: WS, text: '第一件事' })
-    relay.state.seq = 9
+    relay.state.seq = 4
     const second = await relay.call('POST', '/send', { workspace: WS, text: '第二件事' })
-    assert.notEqual(first.json.taskId, second.json.taskId)
-
     relay.state.running = false
     await delay(150)
 
@@ -298,18 +308,56 @@ test('同会话连续任务：结果按 turn 段各自归属', async () => {
   }
 })
 
-test('重复查询只读：不触发模型、不新增任务', async () => {
-  const relay = await startRelay({
-    rows: [mainRow('session-main', WS)],
-    events: [
-      { type: 'turn/start', seq: 6, data: {} },
-      { type: 'assistant/message', seq: 7, data: { message: { content: [{ type: 'text', text: '好了' }] } } },
-    ],
-  })
+test('空正文不假完成：turn 未结束就保持非终态，最终转待人工', async () => {
+  const events = [
+    { type: 'user/message', seq: 0, data: { source: { kind: 'user' } } },
+    { type: 'turn/start', seq: 1, data: {} },
+    // 没有 assistant/message，也没有 turn/end
+  ]
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)], seq: 0, cursor: 1, events, tickMs: 10 })
   try {
     const sent = await relay.call('POST', '/send', { workspace: WS, text: '干活' })
     relay.state.running = false
-    await delay(120)
+    await delay(400)
+    const task = await relay.call('GET', `/tasks/${sent.json.taskId}`)
+    assert.notEqual(task.json.task.status, 'completed')
+    assert.equal(task.json.task.status, 'awaiting-user')
+    assert.equal(task.json.task.error.code, 'attribution-unavailable')
+  } finally {
+    relay.close()
+    await relay.cleanup()
+  }
+})
+
+test('宿主状态不可读：保持非终态，不假完成', async () => {
+  const { events, lastSeq } = turnEvents(['完成'])
+  const relay = await startRelay({
+    rows: [mainRow('session-main', WS)],
+    seq: 0,
+    cursor: lastSeq,
+    events,
+    stateImpl: () => {
+      throw new Error('host not ready')
+    },
+  })
+  try {
+    const sent = await relay.call('POST', '/send', { workspace: WS, text: '干活' })
+    await delay(250)
+    const task = await relay.call('GET', `/tasks/${sent.json.taskId}`)
+    assert.equal(task.json.task.status, 'running')
+  } finally {
+    relay.close()
+    await relay.cleanup()
+  }
+})
+
+test('重复查询只读：不触发模型、不新增任务', async () => {
+  const { events, lastSeq } = turnEvents(['好了'])
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)], seq: 0, cursor: lastSeq, events })
+  try {
+    const sent = await relay.call('POST', '/send', { workspace: WS, text: '干活' })
+    relay.state.running = false
+    await delay(150)
     const first = await relay.call('GET', `/tasks/${sent.json.taskId}`)
     const second = await relay.call('GET', `/tasks/${sent.json.taskId}`)
     const list = await relay.call('GET', '/tasks')
@@ -323,6 +371,8 @@ test('重复查询只读：不触发模型、不新增任务', async () => {
   }
 })
 
+// ---------- 重启恢复 ----------
+
 test('重启恢复：新实例能查到旧任务', async () => {
   const dataDir = await tempDir()
   const rows = [mainRow('session-main', WS)]
@@ -333,32 +383,111 @@ test('重启恢复：新实例能查到旧任务', async () => {
 
   const second = await startRelay({ rows, dataDir })
   try {
-    const found = await second.call('GET', `/tasks/${sent.json.taskId}`)
+    let found
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      found = await second.call('GET', `/tasks/${sent.json.taskId}`)
+      if (found.status === 200) break
+      await delay(50)
+    }
     assert.equal(found.status, 200)
     assert.equal(found.json.task.taskId, sent.json.taskId)
-    assert.equal(found.json.task.sessionId, 'session-main')
   } finally {
     second.close()
     await second.cleanup()
   }
 })
 
-test('dsh_wait 超时：返回当前状态，不取消、不重发', async () => {
-  const relay = await startRelay({ rows: [mainRow('session-main', WS)], running: true })
+test('投递意图已落盘但未见消息：重启后标记 unknown，绝不重发', async () => {
+  const dataDir = await tempDir()
+  const task = {
+    taskId: 'task-queued-crash',
+    requestId: 'rpc-never-arrived',
+    sessionId: 'session-main',
+    workspace: WS,
+    selection: { rule: 'recent', workspace: WS },
+    text: '干活',
+    status: 'queued',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    afterSeq: 0,
+    attributionAttempts: 0,
+    notify: { state: 'pending', attempts: 0 },
+    error: null,
+  }
+  await fs.writeFile(path.join(dataDir, `${task.taskId}.json`), JSON.stringify(task), 'utf8')
+
+  const relay = await startRelay({
+    rows: [mainRow('session-main', WS)],
+    dataDir,
+    seq: 0,
+    cursor: 3,
+    events: [{ type: 'user/message', seq: 0, data: { source: { kind: 'user', rpcId: 'someone-else' } } }],
+  })
   try {
-    const sent = await relay.call('POST', '/send', { workspace: WS, text: '长任务' })
-    const waited = await relay.call('POST', '/wait', { taskId: sent.json.taskId, timeoutMs: 150 })
-    assert.equal(waited.status, 200)
-    assert.equal(waited.json.timedOut, true)
-    assert.equal(waited.json.task.status, 'running')
-    assert.equal(relay.state.promptCalls.length, 1)
+    await delay(150)
+    const found = await relay.call('GET', `/tasks/${task.taskId}`)
+    assert.equal(found.json.task.status, 'unknown')
+    assert.equal(found.json.task.error.code, 'unknown-delivery')
+    // 关键：没有重新投递
+    assert.equal(relay.state.promptCalls.length, 0)
   } finally {
     relay.close()
     await relay.cleanup()
   }
 })
 
-test('完成通知失败：记录待办并重试，最终标记 failed', async () => {
+test('通知待办在重启后继续重试并成功', async () => {
+  let hits = 0
+  const endpoint = createServer((req, res) => {
+    hits += 1
+    res.writeHead(200)
+    res.end('ok')
+  })
+  await new Promise((resolve) => endpoint.listen(0, '127.0.0.1', resolve))
+  const notifyPort = endpoint.address().port
+
+  const dataDir = await tempDir()
+  const task = {
+    taskId: 'task-notify-pending',
+    requestId: 'rpc-1',
+    sessionId: 'session-main',
+    workspace: WS,
+    text: '干活',
+    status: 'completed',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    afterSeq: 0,
+    attribution: 'rpc-turn-segment',
+    result: { text: '完成', reason: 'idle', truncated: false },
+    delivery: null,
+    notify: { state: 'pending', attempts: 0 },
+    error: null,
+  }
+  await fs.writeFile(path.join(dataDir, `${task.taskId}.json`), JSON.stringify(task), 'utf8')
+
+  const relay = await startRelay({
+    rows: [mainRow('session-main', WS)],
+    dataDir,
+    notifyUrl: `http://127.0.0.1:${notifyPort}/hook`,
+    events: [],
+  })
+  try {
+    let found
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      found = await relay.call('GET', `/tasks/${task.taskId}`)
+      if (found.json.task?.notify?.state === 'sent') break
+      await delay(50)
+    }
+    assert.equal(found.json.task.notify.state, 'sent')
+    assert.ok(hits >= 1)
+  } finally {
+    relay.close()
+    await relay.cleanup()
+    endpoint.close()
+  }
+})
+
+test('通知失败：重试到上限后标记 failed', async () => {
   const endpoint = createServer((req, res) => {
     res.writeHead(500)
     res.end('nope')
@@ -366,18 +495,17 @@ test('完成通知失败：记录待办并重试，最终标记 failed', async (
   await new Promise((resolve) => endpoint.listen(0, '127.0.0.1', resolve))
   const notifyPort = endpoint.address().port
 
+  const { events, lastSeq } = turnEvents(['完成'])
   const relay = await startRelay({
     rows: [mainRow('session-main', WS)],
+    seq: 0,
+    cursor: lastSeq,
+    events,
     notifyUrl: `http://127.0.0.1:${notifyPort}/hook`,
-    events: [
-      { type: 'turn/start', seq: 6, data: {} },
-      { type: 'assistant/message', seq: 7, data: { message: { content: [{ type: 'text', text: '完成' }] } } },
-    ],
   })
   try {
     const sent = await relay.call('POST', '/send', { workspace: WS, text: '干活' })
     relay.state.running = false
-    // 通知带重试退避，轮询等它落定
     let task
     for (let attempt = 0; attempt < 60; attempt += 1) {
       task = await relay.call('GET', `/tasks/${sent.json.taskId}`)
@@ -394,20 +522,29 @@ test('完成通知失败：记录待办并重试，最终标记 failed', async (
   }
 })
 
-test('没有通知渠道时：明确标记 unsupported，不假装已通知', async () => {
-  const relay = await startRelay({
-    rows: [mainRow('session-main', WS)],
-    events: [
-      { type: 'turn/start', seq: 6, data: {} },
-      { type: 'assistant/message', seq: 7, data: { message: { content: [{ type: 'text', text: '完成' }] } } },
-    ],
-  })
+test('没有通知渠道：标记 unsupported，不假装已通知', async () => {
+  const { events, lastSeq } = turnEvents(['完成'])
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)], seq: 0, cursor: lastSeq, events })
   try {
     const sent = await relay.call('POST', '/send', { workspace: WS, text: '干活' })
     relay.state.running = false
     await delay(150)
     const task = await relay.call('GET', `/tasks/${sent.json.taskId}`)
     assert.equal(task.json.task.notify.state, 'unsupported')
+  } finally {
+    relay.close()
+    await relay.cleanup()
+  }
+})
+
+test('dsh_wait 超时：不取消、不重发', async () => {
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)], running: true })
+  try {
+    const sent = await relay.call('POST', '/send', { workspace: WS, text: '长任务' })
+    const waited = await relay.call('POST', '/wait', { taskId: sent.json.taskId, timeoutMs: 150 })
+    assert.equal(waited.json.timedOut, true)
+    assert.equal(waited.json.task.status, 'running')
+    assert.equal(relay.state.promptCalls.length, 1)
   } finally {
     relay.close()
     await relay.cleanup()

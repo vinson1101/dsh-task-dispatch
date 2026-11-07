@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-relay",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "向真实的 DSH 会话按工作空间或 session id 投递消息并等待回复的本地 HTTP 中继，零依赖",
   "type": "module",
   "license": "MIT",

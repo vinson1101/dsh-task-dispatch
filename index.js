@@ -19,7 +19,7 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-const VERSION = '0.3.0'
+const VERSION = '0.4.0'
 const NAME = 'dsh-session-relay'
 const MAX_BODY_BYTES = 1024 * 1024
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost'])
@@ -27,6 +27,8 @@ const DEFAULT_WAIT_MS = 120_000
 const DEFAULT_MAX_MESSAGES = 20
 const TERMINAL = new Set(['completed', 'failed'])
 const NOTIFY_ATTEMPTS = 3
+/** 归属连续失败多少次后转「待人工」，避免无限重试，也避免把不知道当成完成。 */
+const ATTRIBUTION_ATTEMPTS = 15
 
 function sendJson(res, status, payload) {
   const body = Buffer.from(JSON.stringify(payload), 'utf8')
@@ -83,16 +85,25 @@ function assistantText(records) {
   return parts.join('\n\n').trim()
 }
 
-/** 从事件数组里再按 turn 边界收窄：从我们那条消息后第一个 turn/start，到下一个 turn/start。 */
-function turnSegment(events, fromSeq) {
+/**
+ * 在事件里定位「属于这次投递的那一个 turn」。
+ * 起点是 startSeq 之后的第一个 turn/start，终点是下一个 turn/start。
+ * finished 只在看到 turn/end 或确实存在下一个 turn 时为真——
+ * 会话空闲本身不算终止证据。
+ */
+function locateTurn(events, startSeq) {
   const starts = events
-    .filter((event) => event?.type === 'turn/start' && typeof event.seq === 'number')
-    .map((event) => event.seq)
-    .sort((a, b) => a - b)
-  const first = starts.find((seq) => seq > fromSeq)
-  if (first === undefined) return events.filter((event) => event.seq > fromSeq)
-  const next = starts.find((seq) => seq > first)
-  return events.filter((event) => event.seq >= first && (next === undefined || event.seq < next))
+    .filter((event) => event?.type === 'turn/start' && typeof event.seq === 'number' && event.seq > startSeq)
+    .sort((a, b) => a.seq - b.seq)
+  const start = starts[0]
+  if (start === undefined) return undefined
+  const next = starts[1]
+  const endSeq = next?.seq
+  const segment = events.filter(
+    (event) => event.seq >= start.seq && (endSeq === undefined || event.seq < endSeq),
+  )
+  const finished = segment.some((event) => event.type === 'turn/end') || next !== undefined
+  return { startSeq: start.seq, endSeq, events: segment, finished }
 }
 
 export function apply(ctx, config = {}) {
@@ -247,7 +258,8 @@ export function apply(ctx, config = {}) {
 
   async function persist(task) {
     const file = taskFile(task.taskId)
-    const temp = `${file}.tmp`
+    // 每次写用独立临时文件，避免重叠 tick / 重叠写入互相踩
+    const temp = `${file}.${process.pid}.${randomUUID()}.tmp`
     await fs.writeFile(temp, JSON.stringify(task, null, 2), 'utf8')
     await fs.rename(temp, file)
   }
@@ -263,7 +275,30 @@ export function apply(ctx, config = {}) {
           const task = JSON.parse(raw)
           if (typeof task?.taskId !== 'string') continue
           tasks.set(task.taskId, task)
-          if (!TERMINAL.has(task.status)) markPending(task)
+
+          if (!TERMINAL.has(task.status) && task.status !== 'awaiting-user') {
+            if (task.status === 'queued') {
+              // 中继在「已投递」与「已落 running」之间崩溃：用稳定 requestId 判定，绝不自动重发
+              if (await findDelivered(task)) {
+                task.status = 'running'
+                markPending(task)
+              } else {
+                task.status = 'unknown'
+                task.error = {
+                  code: 'unknown-delivery',
+                  message: '中继在投递途中重启，无法确认宿主是否已接收；为安全起见不自动重发',
+                }
+              }
+              await persist(task)
+            } else {
+              markPending(task)
+            }
+          }
+
+          // 通知待办独立恢复：任务早已 completed，但通知可能还没发出去
+          if (task.notify?.state !== 'sent' && task.notify?.state !== 'unsupported') {
+            queueNotify(task)
+          }
         } catch {
           // 单个坏文件不影响启动
         }
@@ -318,37 +353,91 @@ export function apply(ctx, config = {}) {
   // ---------- 结果归属 ----------
 
   /**
-   * 读取 (fromSeq, toSeq] 之间、属于这次投递的助手输出。
-   * 优先用宿主的按 seq 事件读取 + turn 边界；读不到就如实标记，不假装成功。
+   * 向后翻页读取 (fromSeq, toSeq]。
+   *
+   * 宿主 history.paginate 的 beforeSeq 是「向过去翻页的排他上界」
+   * （end = min(throughSeq + 1, beforeSeq)），所以取一页后要把上界收到本页最早 seq，
+   * 直到覆盖到 fromSeq，不能只取一次 200 条就声称完整。
    */
-  async function readSegment(sessionId, fromSeq, toSeq) {
+  async function readWindow(sessionId, fromSeq, toSeq) {
     const controller = ctx.get('sessionController')
-    if (typeof controller?.events !== 'function') {
-      return { text: '', attribution: 'unavailable', note: '宿主没有 events 接口' }
-    }
-    if (!Number.isFinite(fromSeq) || !Number.isFinite(toSeq) || toSeq <= fromSeq) {
-      return { text: '', attribution: 'unavailable', note: '缺少可用的 seq 区间' }
-    }
-    try {
-      const page = await controller.events(
+    if (typeof controller?.events !== 'function') throw new Error('宿主没有 events 接口')
+    const collected = []
+    let upper = toSeq + 1
+    for (let page = 0; page < 40; page += 1) {
+      const value = await controller.events(
         {
           address: { kind: 'session', sessionId },
-          beforeSeq: fromSeq,
           throughSeq: toSeq,
+          beforeSeq: upper,
           maxMessages: 200,
         },
         new AbortController().signal,
       )
-      const events = (page?.records ?? []).map((record) => record?.event).filter(Boolean)
-      const segment = turnSegment(events, fromSeq)
-      const text = assistantText(segment.map((event) => ({ event })))
-      return { text, attribution: 'seq-segment' }
-    } catch (error) {
-      return {
-        text: '',
-        attribution: 'unavailable',
-        note: `读取会话事件失败: ${error instanceof Error ? error.message : String(error)}`,
+      const events = (value?.records ?? []).map((record) => record?.event).filter(Boolean)
+      if (events.length === 0) return { events: collected, truncated: false }
+      collected.unshift(...events)
+      const firstSeq = events[0]?.seq
+      if (!Number.isFinite(firstSeq) || firstSeq <= fromSeq + 1) {
+        return { events: collected, truncated: false }
       }
+      if (value?.hasMore !== true) return { events: collected, truncated: true }
+      upper = firstSeq
+    }
+    return { events: collected, truncated: true }
+  }
+
+  /** 用稳定 requestId 判断这条任务是否真的进了会话，用于崩溃恢复，绝不重发。 */
+  async function findDelivered(task) {
+    const state = await safeState(task.sessionId)
+    const cursor = typeof state?.cursor === 'number' ? state.cursor : undefined
+    if (cursor === undefined || !Number.isFinite(task.afterSeq)) return false
+    try {
+      const window = await readWindow(task.sessionId, task.afterSeq, cursor)
+      return window.events.some(
+        (event) => event.type === 'user/message' && event.data?.source?.rpcId === task.requestId,
+      )
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 判定任务是否真的结束，并取回属于它的正文。
+   * 归属优先用 requestId 找到我们那条 user 消息，再按 turn 边界切段。
+   */
+  async function readTaskResult(task, state) {
+    const cursor = typeof state?.cursor === 'number' ? state.cursor : undefined
+    if (cursor === undefined) return { kind: 'pending', note: '拿不到会话游标' }
+    if (!Number.isFinite(task.afterSeq)) {
+      return { kind: 'pending', note: '缺少投递位置 afterSeq' }
+    }
+
+    let window
+    try {
+      window = await readWindow(task.sessionId, task.afterSeq, cursor)
+    } catch (error) {
+      return { kind: 'pending', note: `读取事件失败: ${error instanceof Error ? error.message : String(error)}` }
+    }
+
+    const events = window.events
+    const ours = events.find(
+      (event) => event.type === 'user/message' && event.data?.source?.rpcId === task.requestId,
+    )
+    const attribution = ours === undefined ? 'seq-turn-segment' : 'rpc-turn-segment'
+    const startSeq = ours?.seq ?? task.afterSeq
+
+    const turn = locateTurn(events, startSeq)
+    if (turn === undefined) return { kind: 'pending', attribution, note: '该任务的 turn 尚未开始' }
+    if (!turn.finished) return { kind: 'pending', attribution, note: 'turn 尚未结束' }
+
+    const text = assistantText(turn.events.map((event) => ({ event })))
+    return {
+      kind: 'completed',
+      text,
+      attribution,
+      truncated: window.truncated,
+      endSeq: turn.endSeq ?? cursor,
     }
   }
 
@@ -356,9 +445,10 @@ export function apply(ctx, config = {}) {
     const ids = pending.get(sessionId)
     if (ids === undefined || ids.size === 0) return
     const state = await safeState(sessionId)
-    // 只有会话空闲才收尾，避免把「仍在跑」误判成完成
-    if (state?.running === true) return
-    const cursor = typeof state?.cursor === 'number' ? state.cursor : undefined
+    // 宿主不可读 = 未知，不是完成。保持非终态，下一次 tick 再试。
+    if (state === undefined) return
+    // 仍在跑就等，不做任何判定。
+    if (state.running === true) return
 
     const ordered = [...ids]
       .map((id) => tasks.get(id))
@@ -366,17 +456,42 @@ export function apply(ctx, config = {}) {
       .sort((a, b) => (a.afterSeq ?? 0) - (b.afterSeq ?? 0))
 
     for (const task of ordered) {
-      if (TERMINAL.has(task.status)) continue
-      const endSeq = cursor ?? task.afterSeq
-      const segment = await readSegment(task.sessionId, task.afterSeq, endSeq)
+      if (TERMINAL.has(task.status) || task.status === 'awaiting-user') continue
+      const outcome = await readTaskResult(task, state)
+
+      // 没有真实终止证据就不收尾：宁可继续等，也不把「不知道」写成「已完成」。
+      if (outcome.kind !== 'completed') {
+        const attempts = (task.attributionAttempts ?? 0) + 1
+        if (attempts >= ATTRIBUTION_ATTEMPTS) {
+          await patchTask(task, {
+            status: 'awaiting-user',
+            attributionAttempts: attempts,
+            attributionNote: outcome.note ?? '无法确认任务终止证据',
+            error: {
+              code: 'attribution-unavailable',
+              message: '无法把结果归属到该任务，需要人工确认；未自动重发',
+            },
+          })
+          queueNotify(task)
+        } else {
+          await patchTask(task, { attributionAttempts: attempts, attributionNote: outcome.note })
+        }
+        continue
+      }
+
       const delivery = await gitInfo(task.workspace)
       await patchTask(task, {
         status: 'completed',
         finishedAt: new Date().toISOString(),
-        endSeq,
-        attribution: segment.attribution,
-        ...(segment.note === undefined ? {} : { attributionNote: segment.note }),
-        result: { text: segment.text, reason: 'idle', truncated: false },
+        endSeq: outcome.endSeq,
+        attribution: outcome.attribution,
+        attributionAttempts: 0,
+        result: {
+          text: outcome.text,
+          reason: 'idle',
+          truncated: outcome.truncated,
+          empty: outcome.text === '',
+        },
         delivery: {
           ...(delivery ?? {}),
           tests: null,
@@ -384,54 +499,92 @@ export function apply(ctx, config = {}) {
           note: '分支与提交为只读探测；测试结论与剩余问题需从任务正文读取',
         },
       })
-      await notify(task)
+      queueNotify(task)
     }
   }
 
+  let ticking = false
   async function tick() {
-    const sessionIds = [...pending.keys()]
-    for (const sessionId of sessionIds) {
-      try {
-        await finalizeSession(sessionId)
-      } catch (error) {
-        console.error(`[${NAME}] 收尾 ${sessionId} 失败: ${error instanceof Error ? error.message : String(error)}`)
+    // 在途互斥：慢宿主或重叠定时器不该并发收尾同一个会话
+    if (ticking) return
+    ticking = true
+    try {
+      for (const sessionId of [...pending.keys()]) {
+        try {
+          await finalizeSession(sessionId)
+        } catch (error) {
+          console.error(
+            `[${NAME}] 收尾 ${sessionId} 失败: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
       }
+      await drainNotify()
+    } finally {
+      ticking = false
     }
   }
 
   // ---------- 完成通知 ----------
 
-  async function notify(task) {
+  /** 通知待办与任务跟踪解耦：任务结束后仍可能没发出去，重启后必须继续。 */
+  const notifyQueue = new Set()
+
+  function queueNotify(task) {
     if (notifyUrl === undefined) {
-      await patchTask(task, { notify: { state: 'unsupported', attempts: 0 } })
+      if (task.notify?.state !== 'unsupported') {
+        void patchTask(task, { notify: { state: 'unsupported', attempts: 0 } })
+      }
       return
     }
-    let attempts = 0
-    let lastError
-    while (attempts < NOTIFY_ATTEMPTS) {
-      attempts += 1
-      try {
-        const response = await fetch(notifyUrl, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            taskId: task.taskId,
-            sessionId: task.sessionId,
-            workspace: task.workspace,
-            status: task.status,
-            result: task.result,
-            delivery: task.delivery,
-          }),
-        })
-        if (!response.ok) throw new Error(`通知端点返回 ${String(response.status)}`)
-        await patchTask(task, { notify: { state: 'sent', attempts, at: new Date().toISOString() } })
-        return
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error)
-        await new Promise((resolve) => setTimeout(resolve, 50 * attempts))
+    if ((task.notify?.attempts ?? 0) >= NOTIFY_ATTEMPTS) return
+    if (task.notify?.state === 'sent') return
+    notifyQueue.add(task.taskId)
+  }
+
+  async function notifyOnce(task) {
+    const attempts = (task.notify?.attempts ?? 0) + 1
+    // 先落盘尝试次数：进程在请求途中被中断，重启后也知道已经试过几次
+    await patchTask(task, { notify: { ...(task.notify ?? {}), state: 'sending', attempts } })
+    try {
+      const response = await fetch(notifyUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'idempotency-key': task.taskId },
+        body: JSON.stringify({
+          taskId: task.taskId,
+          requestId: task.requestId,
+          sessionId: task.sessionId,
+          workspace: task.workspace,
+          status: task.status,
+          attribution: task.attribution,
+          result: task.result,
+          delivery: task.delivery,
+        }),
+        signal: AbortSignal.timeout(8000),
+      })
+      if (!response.ok) throw new Error(`通知端点返回 ${String(response.status)}`)
+      await patchTask(task, { notify: { state: 'sent', attempts, at: new Date().toISOString() } })
+      notifyQueue.delete(task.taskId)
+    } catch (error) {
+      const lastError = error instanceof Error ? error.message : String(error)
+      if (attempts >= NOTIFY_ATTEMPTS) {
+        await patchTask(task, { notify: { state: 'failed', attempts, error: lastError } })
+        notifyQueue.delete(task.taskId)
+      } else {
+        // 保持 pending，下一次 tick 继续重试，不丢
+        await patchTask(task, { notify: { state: 'pending', attempts, error: lastError } })
       }
     }
-    await patchTask(task, { notify: { state: 'failed', attempts, error: lastError } })
+  }
+
+  async function drainNotify() {
+    for (const taskId of [...notifyQueue]) {
+      const task = tasks.get(taskId)
+      if (task === undefined) {
+        notifyQueue.delete(taskId)
+        continue
+      }
+      await notifyOnce(task)
+    }
   }
 
   // ---------- 目标解析 ----------
@@ -560,14 +713,21 @@ export function apply(ctx, config = {}) {
       updatedAt: new Date().toISOString(),
       startedAt: null,
       finishedAt: null,
-      afterSeq: -1,
+      afterSeq: typeof ctx.get('sessions')?.get?.(target.sessionId)?.seq === 'number'
+        ? ctx.get('sessions').get(target.sessionId).seq - 1
+        : -1,
       endSeq: null,
       attribution: null,
+      attributionAttempts: 0,
       result: null,
       delivery: null,
       notify: { state: 'pending', attempts: 0 },
       error: null,
     }
+
+    // 先落盘「投递意图」：宿主已接收但中继崩溃时，重启后靠 requestId 判定，绝不自动重发
+    tasks.set(task.taskId, task)
+    await persist(task)
 
     try {
       await controller.prompt(
@@ -593,10 +753,9 @@ export function apply(ctx, config = {}) {
     if (target.selection?.workspace !== undefined) bindings.set(target.selection.workspace, target.sessionId)
 
     const session = ctx.get('sessions')?.get?.(target.sessionId)
-    task.afterSeq = typeof session?.seq === 'number' ? session.seq - 1 : -1
+    if (typeof session?.seq === 'number') task.afterSeq = session.seq - 1
     task.status = 'running'
     task.startedAt = new Date().toISOString()
-    tasks.set(task.taskId, task)
     markPending(task)
     await persist(task)
 
@@ -757,15 +916,23 @@ export function apply(ctx, config = {}) {
 
   let timer
   ctx.effect(() => {
-    void loadTasks().then(() => {
+    let disposed = false
+    // 先载入历史任务再监听：避免启动瞬间把已有任务误报成「不存在」
+    const boot = async () => {
+      await loadTasks()
       console.log(`[${NAME}] 已载入 ${String(tasks.size)} 个历史任务`)
+      if (disposed) return
+      server.listen(port, host, () => {
+        console.log(`[${NAME}] 已就绪 http://${host}:${String(port)}  v${VERSION}`)
+      })
+      timer = setInterval(() => void tick(), tickMs)
+      timer.unref?.()
+    }
+    void boot().catch((error) => {
+      console.error(`[${NAME}] 启动失败: ${error instanceof Error ? error.message : String(error)}`)
     })
-    server.listen(port, host, () => {
-      console.log(`[${NAME}] 已就绪 http://${host}:${String(port)}  v${VERSION}`)
-    })
-    timer = setInterval(() => void tick(), tickMs)
-    timer.unref?.()
     return () => {
+      disposed = true
       if (timer !== undefined) clearInterval(timer)
       server.close()
     }
