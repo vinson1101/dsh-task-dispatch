@@ -19,7 +19,7 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-const VERSION = '0.4.0'
+const VERSION = '0.4.1'
 const NAME = 'dsh-session-relay'
 const MAX_BODY_BYTES = 1024 * 1024
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost'])
@@ -68,7 +68,7 @@ async function readJsonBody(req) {
   return parsed
 }
 
-function assistantText(records) {
+export function assistantText(records) {
   if (!Array.isArray(records)) return ''
   const parts = []
   for (const record of records) {
@@ -86,24 +86,33 @@ function assistantText(records) {
 }
 
 /**
- * 在事件里定位「属于这次投递的那一个 turn」。
- * 起点是 startSeq 之后的第一个 turn/start，终点是下一个 turn/start。
- * finished 只在看到 turn/end 或确实存在下一个 turn 时为真——
- * 会话空闲本身不算终止证据。
+ * 把结果归属到「包含我们这条 user 消息的那一个 turn」。
+ *
+ * 真实事件顺序是：agent/inbox/spliced → turn/start → … → user/message → assistant/message → turn/end。
+ * turn 比 user 消息先开始，所以不能用「消息之后的第一个 turn/start」，
+ * 必须取 seq ≤ ourSeq 的最后一个 turn/start。
  */
-function locateTurn(events, startSeq) {
-  const starts = events
-    .filter((event) => event?.type === 'turn/start' && typeof event.seq === 'number' && event.seq > startSeq)
-    .sort((a, b) => a.seq - b.seq)
-  const start = starts[0]
-  if (start === undefined) return undefined
-  const next = starts[1]
-  const endSeq = next?.seq
-  const segment = events.filter(
-    (event) => event.seq >= start.seq && (endSeq === undefined || event.seq < endSeq),
+export function attributeTurn(events, ourSeq) {
+  const sorted = [...events]
+    .filter((event) => typeof event?.seq === 'number')
+    .sort((left, right) => left.seq - right.seq)
+
+  const startsBefore = sorted.filter((event) => event.type === 'turn/start' && event.seq <= ourSeq)
+  const turnStart = startsBefore.at(-1)
+  if (turnStart === undefined) return undefined
+
+  const after = sorted.filter((event) => event.seq > ourSeq)
+  const nextStart = after.find((event) => event.type === 'turn/start')
+  const turnEnd = after.find(
+    (event) => event.type === 'turn/end' && (nextStart === undefined || event.seq < nextStart.seq),
   )
-  const finished = segment.some((event) => event.type === 'turn/end') || next !== undefined
-  return { startSeq: start.seq, endSeq, events: segment, finished }
+
+  // 终止证据：这个 turn 自己的 turn/end，或确实开始了下一个 turn
+  const finished = turnEnd !== undefined || nextStart !== undefined
+  const endSeq = turnEnd?.seq ?? nextStart?.seq
+  const segment = after.filter((event) => endSeq === undefined || event.seq <= endSeq)
+
+  return { startSeq: turnStart.seq, endSeq, events: segment, finished }
 }
 
 export function apply(ctx, config = {}) {
@@ -425,9 +434,9 @@ export function apply(ctx, config = {}) {
       (event) => event.type === 'user/message' && event.data?.source?.rpcId === task.requestId,
     )
     const attribution = ours === undefined ? 'seq-turn-segment' : 'rpc-turn-segment'
-    const startSeq = ours?.seq ?? task.afterSeq
+    const ourSeq = ours?.seq ?? task.afterSeq
 
-    const turn = locateTurn(events, startSeq)
+    const turn = attributeTurn(events, ourSeq)
     if (turn === undefined) return { kind: 'pending', attribution, note: '该任务的 turn 尚未开始' }
     if (!turn.finished) return { kind: 'pending', attribution, note: 'turn 尚未结束' }
 

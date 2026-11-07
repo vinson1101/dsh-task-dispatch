@@ -176,15 +176,18 @@ const turnEvents = (texts) => {
   const events = []
   let seq = 0
   for (const text of texts) {
-    events.push({ type: 'user/message', seq: seq, data: { source: { kind: 'user' } } })
+    // 真实顺序：消息先进 inbox，turn 才开始，user/message 在 turn 内部落盘
+    events.push({ type: 'agent/inbox/spliced', seq: seq, data: { target: 'next-turn' } })
     seq += 1
     events.push({ type: 'turn/start', seq: seq, data: {} })
+    seq += 1
+    events.push({ type: 'user/message', seq: seq, data: { source: { kind: 'user' } } })
     seq += 1
     if (text !== null) {
       events.push({ type: 'assistant/message', seq: seq, data: { message: { content: [{ type: 'text', text }] } } })
       seq += 1
     }
-    events.push({ type: 'turn/end', seq: seq, data: {} })
+    events.push({ type: 'turn/end', seq: seq, data: { reason: { kind: 'completed' } } })
     seq += 1
   }
   return { events, lastSeq: seq - 1 }
@@ -293,7 +296,7 @@ test('同会话连续任务：各自归属，不串内容', async () => {
   const relay = await startRelay({ rows: [mainRow('session-main', WS)], seq: 0, cursor: lastSeq, events })
   try {
     const first = await relay.call('POST', '/send', { workspace: WS, text: '第一件事' })
-    relay.state.seq = 4
+    relay.state.seq = 5
     const second = await relay.call('POST', '/send', { workspace: WS, text: '第二件事' })
     relay.state.running = false
     await delay(150)
@@ -310,11 +313,12 @@ test('同会话连续任务：各自归属，不串内容', async () => {
 
 test('空正文不假完成：turn 未结束就保持非终态，最终转待人工', async () => {
   const events = [
-    { type: 'user/message', seq: 0, data: { source: { kind: 'user' } } },
+    { type: 'agent/inbox/spliced', seq: 0, data: {} },
     { type: 'turn/start', seq: 1, data: {} },
+    { type: 'user/message', seq: 2, data: { source: { kind: 'user' } } },
     // 没有 assistant/message，也没有 turn/end
   ]
-  const relay = await startRelay({ rows: [mainRow('session-main', WS)], seq: 0, cursor: 1, events, tickMs: 10 })
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)], seq: 0, cursor: 2, events, tickMs: 10 })
   try {
     const sent = await relay.call('POST', '/send', { workspace: WS, text: '干活' })
     relay.state.running = false
