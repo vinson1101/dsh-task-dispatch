@@ -84,6 +84,14 @@ Wrap that curl in an MCP server if you want Codex to call it as a tool.
 - Any local process can call it, so set `token` before exposing anything
 - It drives a real agent, which can execute commands and edit files — treat it as local shell-level access
 
+## Callback: not supported yet
+
+The task result is **not pushed back** to the caller. There is no MCP server→client notification implementation, and whether such a notification could wake an idle Codex session is unverified.
+
+`notify` is a delivery *ledger*, not proof of receipt: `unsupported` / `pending` / `sending` / `sent` / `failed`. A webhook returning 200 only means the HTTP endpoint answered.
+
+Retrieve results by querying: `GET /tasks/:id` (`dsh_result`) or `POST /wait` (`dsh_wait`). Neither resends the task.
+
 ## Limitations
 
 - `/sessions` lists live sessions only; a cold session still accepts `/send` if you know its id

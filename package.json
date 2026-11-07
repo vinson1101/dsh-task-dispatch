@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-relay",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "向真实的 DSH 会话按工作空间或 session id 投递消息并等待回复的本地 HTTP 中继，零依赖",
   "type": "module",
   "license": "MIT",
@@ -33,5 +33,13 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "author": "vinson1101",
+  "engines": {
+    "dsh": ">=0.2.2-rc.1",
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

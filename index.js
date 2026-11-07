@@ -19,7 +19,7 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-const VERSION = '0.4.1'
+const VERSION = '0.5.0'
 const NAME = 'dsh-session-relay'
 const MAX_BODY_BYTES = 1024 * 1024
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost'])

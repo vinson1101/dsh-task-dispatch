@@ -17,11 +17,14 @@
 ## 安装
 
 ```bash
-# 本地目录（开发时）
+# 从 npm 安装（发布后）
+dsh plugin --profile desktop add dsh-session-relay@latest
+
+# 从本地目录安装（开发时，软链，改代码即时生效）
 dsh plugin --profile desktop add /绝对路径/dsh-session-relay
 
-# 或发布到 npm 之后
-dsh plugin --profile desktop add dsh-session-relay@latest
+# 从本地 tarball 安装（等价于正式包，需要重启生效）
+npm pack && dsh plugin --profile desktop add /绝对路径/dsh-session-relay-0.5.0.tgz
 ```
 
 安装后重启 DSH，日志里会出现：
@@ -99,6 +102,15 @@ curl -s -X POST http://127.0.0.1:7391/send \
 - 默认只监听 `127.0.0.1`，代码里硬性拒绝非回环地址
 - 同一台机器上的任何进程都能调用，**对外暴露前务必设置 `token`**
 - 它能驱动真实的 agent，也就意味着能间接执行命令、改文件——当成本机 shell 级别的权限对待
+
+## 回传：目前**不支持**主动回调
+
+这是当前最重要的一条限制，写在这里避免误解：
+
+- 任务结束后，中继**不会**主动把结果推回调用方会话。MCP 的 server→client 通知能不能唤醒一个正在等结果的 Codex 会话，尚未验证，也没有实现。
+- `notify` 字段只是**待办记录**：`unsupported`（没有配置渠道）、`pending`/`sending`（正在重试）、`sent`/`failed`（webhook 结果）。它代表"中继尝试过 HTTP 回调"，不代表"调用方已经收到并开始处理"。
+- 取结果的正确方式是调用方**主动查询**：`GET /tasks/:id` 或 `dsh_result`；或长轮询 `POST /wait` / `dsh_wait`。二者都不会重发任务。
+- 配置了 `notifyUrl` 时，中继会 POST 一个 JSON 到该地址（带 `idempotency-key: taskId`），失败重试 3 次，重启后继续重试。这只是"外部回调"，不是 MCP 通知。
 
 ## 已知限制
 
