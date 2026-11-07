@@ -45,8 +45,14 @@ dsh plugin --profile desktop add dsh-session-relay@latest
 | `GET` | `/health` | 存活检查，无需 token |
 | `GET` | `/workspaces` | 列出已注册的工作空间（项目目录） |
 | `GET` | `/sessions` | 列出会话，**含休眠会话**；支持 `?cwd=` 与 `?query=` |
-| `POST` | `/send` | 投递一条消息，立刻返回（202） |
-| `POST` | `/ask` | 投递并等待这一轮跑完，返回助手正文 |
+| `POST` | `/send` | 派工，立刻返回 `taskId`（202） |
+| `POST` | `/ask` | 派工并等待；超时返回 `status: running` 与 `taskId`，不重发 |
+| `GET` | `/tasks` | 任务列表，可按 `sessionId` / `workspace` / `status` 过滤 |
+| `GET` | `/tasks/:id` | 只读查询单个任务，不触发模型 |
+| `POST` | `/wait` | 等待任务状态变化，超时不取消、不重发 |
+
+任务记录持久化在 `$DSH_HOME/relay/tasks/<taskId>.json`，中继重启后仍可查询。
+完成状态按「本次投递之后的 turn 段」归属，不看会话是否空闲；拿不到事件区间时 `attribution` 会标为 `unavailable`，不会假装成功。
 
 ### 投给谁：工作空间优先
 

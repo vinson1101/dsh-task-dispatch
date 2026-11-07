@@ -1,25 +1,33 @@
 /**
- * dsh-session-relay — 让本机上的外部程序按「工作空间」或 session id 给真实的 DSH 会话投递消息。
+ * dsh-session-relay — 按「工作空间」或 session id 给真实 DSH 会话派活，
+ * 并提供任务的持久记录、只读结果查询、等待与完成通知待办。
  *
- * 设计约束：零依赖。只使用 Node 内置模块和宿主正在运行的服务
- * （`ctx.sessionController` / `ctx.workspaceRegistry` / `ctx.sessionPersistence`），
- * 不声明任何 @deepseek-ai/* 依赖，因此不会与宿主版本产生“双份包”冲突。
+ * 设计约束：零依赖。只用 Node 内置模块 + 宿主已有的服务。
+ * 会话归属只用宿主字段（origin / parentSessionId / archivedSessionIds），不猜 id。
  *
- * 会话归属判定只使用宿主声明的字段（origin / parentSessionId / archivedSessionIds），
- * 绝不根据 session id 的字面形态猜测。
+ * 任务归属：结果按「我们投递的那条 user 消息之后的 turn 段」切分，
+ * 而不是「会话空闲了就算完成」。
  */
 
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { promises as fs } from 'node:fs'
+import { homedir } from 'node:os'
+import path from 'node:path'
+import { promisify } from 'node:util'
 
-const VERSION = '0.2.0'
+const execFileAsync = promisify(execFile)
+
+const VERSION = '0.3.0'
 const NAME = 'dsh-session-relay'
 const MAX_BODY_BYTES = 1024 * 1024
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost'])
 const DEFAULT_WAIT_MS = 120_000
 const DEFAULT_MAX_MESSAGES = 20
+const TERMINAL = new Set(['completed', 'failed'])
+const NOTIFY_ATTEMPTS = 3
 
-/** @param {import('node:http').ServerResponse} res */
 function sendJson(res, status, payload) {
   const body = Buffer.from(JSON.stringify(payload), 'utf8')
   res.writeHead(status, {
@@ -42,7 +50,6 @@ function httpError(status, code, message, details) {
   return error
 }
 
-/** @param {import('node:http').IncomingMessage} req */
 async function readJsonBody(req) {
   const chunks = []
   let size = 0
@@ -59,10 +66,6 @@ async function readJsonBody(req) {
   return parsed
 }
 
-/**
- * 从 wait() 返回的 records 里抽出助手正文。
- * @param {unknown} records
- */
 function assistantText(records) {
   if (!Array.isArray(records)) return ''
   const parts = []
@@ -80,28 +83,47 @@ function assistantText(records) {
   return parts.join('\n\n').trim()
 }
 
-/**
- * @param {any} ctx Cordis 上下文
- * @param {{ port?: number, host?: string, token?: string }} config
- */
+/** 从事件数组里再按 turn 边界收窄：从我们那条消息后第一个 turn/start，到下一个 turn/start。 */
+function turnSegment(events, fromSeq) {
+  const starts = events
+    .filter((event) => event?.type === 'turn/start' && typeof event.seq === 'number')
+    .map((event) => event.seq)
+    .sort((a, b) => a - b)
+  const first = starts.find((seq) => seq > fromSeq)
+  if (first === undefined) return events.filter((event) => event.seq > fromSeq)
+  const next = starts.find((seq) => seq > first)
+  return events.filter((event) => event.seq >= first && (next === undefined || event.seq < next))
+}
+
 export function apply(ctx, config = {}) {
   const port = Number(config.port ?? 7391)
   const host = String(config.host ?? '127.0.0.1')
   const token =
     typeof config.token === 'string' && config.token.trim() !== '' ? config.token.trim() : undefined
+  const tickMs = Number.isInteger(config.tickMs) && config.tickMs > 0 ? config.tickMs : 2000
+  const notifyUrl =
+    typeof config.notifyUrl === 'string' && config.notifyUrl.trim() !== '' ? config.notifyUrl.trim() : undefined
+  const dataDir =
+    typeof config.dataDir === 'string' && config.dataDir.trim() !== ''
+      ? config.dataDir.trim()
+      : path.join(process.env.DSH_HOME ?? path.join(homedir(), '.dsh'), 'relay', 'tasks')
 
   if (!LOOPBACK_HOSTS.has(host)) throw new Error(`${NAME}: host 只能是回环地址，收到 "${host}"`)
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`${NAME}: 端口非法 "${String(config.port)}"`)
-  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`${NAME}: 端口非法`)
 
-  /** workspace 路径 → 最近一次成功投递的主会话（绑定）；失效即重新解析。 */
+  /** taskId → task */
+  const tasks = new Map()
+  /** sessionId → Set(taskId) 仍在排队/运行的任务 */
+  const pending = new Map()
+  /** workspace 路径 → 最近一次成功投递的主会话 */
   const bindings = new Map()
+  /** 等待中的长轮询：taskId → Set(resolve) */
+  const waiters = new Map()
 
   function requireSessionController() {
     const controller = ctx.get('sessionController')
     if (controller === undefined) {
-      throw httpError(503, 'controller-unavailable', `${NAME}: 宿主没有 sessionController 服务，无法投递消息`)
+      throw httpError(503, 'controller-unavailable', `${NAME}: 宿主没有 sessionController 服务`)
     }
     return controller
   }
@@ -128,24 +150,15 @@ export function apply(ctx, config = {}) {
     return Array.isArray(ids) ? new Set(ids) : new Set()
   }
 
-  /**
-   * 只用宿主声明的字段判断会话类型与可投递性。
-   * @param {any} row 宿主 list() 返回的行
-   * @param {Set<string>} archived
-   */
   function classify(row, archived) {
     const sessionId = row?.sessionId
     const reasons = []
-
     if (row?.origin === 'subagent' || row?.parentSessionId !== undefined) {
       reasons.push('子代理会话：由父会话拥有，不能直接接收外部消息')
     }
     if (archived.has(sessionId)) reasons.push('已归档会话')
-    if (row?.formatStatus === 'migration-required') {
-      reasons.push('会话格式待迁移：需要先在 GUI 里打开一次')
-    }
+    if (row?.formatStatus === 'migration-required') reasons.push('会话格式待迁移：需要先在 GUI 里打开一次')
     if (row?.cwd === undefined) reasons.push('会话缺少工作目录')
-
     return {
       kind: row?.origin === 'subagent' || row?.parentSessionId !== undefined ? 'subagent' : 'main',
       deliverable: reasons.length === 0,
@@ -154,7 +167,6 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** 读宿主完整会话列表（含休眠），失败时退化为活跃会话。 */
   async function rawRows() {
     const controller = ctx.get('sessionController')
     if (typeof controller?.list === 'function') {
@@ -166,8 +178,7 @@ export function apply(ctx, config = {}) {
       }
     }
     const agents = ctx.get('agents')
-    const rows = typeof agents?.list === 'function' ? agents.list() : []
-    return rows
+    return (typeof agents?.list === 'function' ? agents.list() : [])
       .filter((agent) => typeof agent?.id === 'string')
       .map((agent) => ({
         sessionId: agent.id,
@@ -190,10 +201,6 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /**
-   * 列出会话，并附带类型、可投递性与不可投递原因。
-   * @param {{ query?: string, cwd?: string }} filter
-   */
   async function listSessions({ query, cwd } = {}) {
     const archived = archivedIds()
     const live = new Map()
@@ -201,18 +208,14 @@ export function apply(ctx, config = {}) {
     for (const agent of typeof agents?.list === 'function' ? agents.list() : []) {
       if (typeof agent?.id === 'string') live.set(agent.id, agent?.status === 'running')
     }
-
     const needle = query === undefined ? undefined : query.toLowerCase()
-    const rows = await rawRows()
     const out = []
-    for (const row of rows) {
+    for (const row of await rawRows()) {
       const sessionId = row?.sessionId
       if (typeof sessionId !== 'string') continue
       if (cwd !== undefined && row?.cwd !== cwd) continue
-
       const title = await titleOf(sessionId)
       if (needle !== undefined && !(title ?? '').toLowerCase().includes(needle)) continue
-
       const info = classify(row, archived)
       out.push({
         sessionId,
@@ -227,39 +230,227 @@ export function apply(ctx, config = {}) {
         ...(row?.parentSessionId === undefined ? {} : { parentSessionId: row.parentSessionId }),
         ...(archived.has(sessionId) ? { archived: true } : {}),
         ...(typeof row?.updatedAt === 'number' ? { updatedAt: new Date(row.updatedAt).toISOString() } : {}),
-        ...(row?.blank === true ? { blank: true } : {}),
       })
     }
     return out
   }
 
+  // ---------- 任务持久化 ----------
+
+  async function ensureDir() {
+    await fs.mkdir(dataDir, { recursive: true })
+  }
+
+  function taskFile(taskId) {
+    return path.join(dataDir, `${taskId}.json`)
+  }
+
+  async function persist(task) {
+    const file = taskFile(task.taskId)
+    const temp = `${file}.tmp`
+    await fs.writeFile(temp, JSON.stringify(task, null, 2), 'utf8')
+    await fs.rename(temp, file)
+  }
+
+  async function loadTasks() {
+    try {
+      await ensureDir()
+      const names = await fs.readdir(dataDir)
+      for (const name of names) {
+        if (!name.endsWith('.json')) continue
+        try {
+          const raw = await fs.readFile(path.join(dataDir, name), 'utf8')
+          const task = JSON.parse(raw)
+          if (typeof task?.taskId !== 'string') continue
+          tasks.set(task.taskId, task)
+          if (!TERMINAL.has(task.status)) markPending(task)
+        } catch {
+          // 单个坏文件不影响启动
+        }
+      }
+    } catch {
+      // 没有数据目录也算正常
+    }
+  }
+
+  function markPending(task) {
+    const set = pending.get(task.sessionId) ?? new Set()
+    set.add(task.taskId)
+    pending.set(task.sessionId, set)
+  }
+
+  function unmarkPending(task) {
+    const set = pending.get(task.sessionId)
+    if (set === undefined) return
+    set.delete(task.taskId)
+    if (set.size === 0) pending.delete(task.sessionId)
+  }
+
+  async function patchTask(task, changes) {
+    Object.assign(task, changes, { updatedAt: new Date().toISOString() })
+    if (TERMINAL.has(task.status) || task.status === 'awaiting-user' || task.status === 'timeout') {
+      unmarkPending(task)
+    }
+    await persist(task)
+    const listeners = waiters.get(task.taskId)
+    if (listeners !== undefined && changes.status !== undefined) {
+      for (const resolve of listeners) resolve(task)
+      waiters.delete(task.taskId)
+    }
+    return task
+  }
+
+  // ---------- 交付信息 ----------
+
+  async function gitInfo(cwd) {
+    if (typeof cwd !== 'string' || cwd === '') return null
+    try {
+      const [branch, head] = await Promise.all([
+        execFileAsync('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD'], { timeout: 5000 }),
+        execFileAsync('git', ['-C', cwd, 'rev-parse', 'HEAD'], { timeout: 5000 }),
+      ])
+      return { branch: String(branch.stdout).trim(), headSha: String(head.stdout).trim() }
+    } catch {
+      return null
+    }
+  }
+
+  // ---------- 结果归属 ----------
+
   /**
-   * 在同一工作空间里挑一个稳定的主会话。
-   * 规则：绑定优先 → 运行中优先 → 最近活动的非空白会话 → 最近活动会话；
-   * 同分时按 sessionId 字典序，保证结果稳定可复现。
+   * 读取 (fromSeq, toSeq] 之间、属于这次投递的助手输出。
+   * 优先用宿主的按 seq 事件读取 + turn 边界；读不到就如实标记，不假装成功。
    */
+  async function readSegment(sessionId, fromSeq, toSeq) {
+    const controller = ctx.get('sessionController')
+    if (typeof controller?.events !== 'function') {
+      return { text: '', attribution: 'unavailable', note: '宿主没有 events 接口' }
+    }
+    if (!Number.isFinite(fromSeq) || !Number.isFinite(toSeq) || toSeq <= fromSeq) {
+      return { text: '', attribution: 'unavailable', note: '缺少可用的 seq 区间' }
+    }
+    try {
+      const page = await controller.events(
+        {
+          address: { kind: 'session', sessionId },
+          beforeSeq: fromSeq,
+          throughSeq: toSeq,
+          maxMessages: 200,
+        },
+        new AbortController().signal,
+      )
+      const events = (page?.records ?? []).map((record) => record?.event).filter(Boolean)
+      const segment = turnSegment(events, fromSeq)
+      const text = assistantText(segment.map((event) => ({ event })))
+      return { text, attribution: 'seq-segment' }
+    } catch (error) {
+      return {
+        text: '',
+        attribution: 'unavailable',
+        note: `读取会话事件失败: ${error instanceof Error ? error.message : String(error)}`,
+      }
+    }
+  }
+
+  async function finalizeSession(sessionId) {
+    const ids = pending.get(sessionId)
+    if (ids === undefined || ids.size === 0) return
+    const state = await safeState(sessionId)
+    // 只有会话空闲才收尾，避免把「仍在跑」误判成完成
+    if (state?.running === true) return
+    const cursor = typeof state?.cursor === 'number' ? state.cursor : undefined
+
+    const ordered = [...ids]
+      .map((id) => tasks.get(id))
+      .filter(Boolean)
+      .sort((a, b) => (a.afterSeq ?? 0) - (b.afterSeq ?? 0))
+
+    for (const task of ordered) {
+      if (TERMINAL.has(task.status)) continue
+      const endSeq = cursor ?? task.afterSeq
+      const segment = await readSegment(task.sessionId, task.afterSeq, endSeq)
+      const delivery = await gitInfo(task.workspace)
+      await patchTask(task, {
+        status: 'completed',
+        finishedAt: new Date().toISOString(),
+        endSeq,
+        attribution: segment.attribution,
+        ...(segment.note === undefined ? {} : { attributionNote: segment.note }),
+        result: { text: segment.text, reason: 'idle', truncated: false },
+        delivery: {
+          ...(delivery ?? {}),
+          tests: null,
+          leftovers: null,
+          note: '分支与提交为只读探测；测试结论与剩余问题需从任务正文读取',
+        },
+      })
+      await notify(task)
+    }
+  }
+
+  async function tick() {
+    const sessionIds = [...pending.keys()]
+    for (const sessionId of sessionIds) {
+      try {
+        await finalizeSession(sessionId)
+      } catch (error) {
+        console.error(`[${NAME}] 收尾 ${sessionId} 失败: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+  }
+
+  // ---------- 完成通知 ----------
+
+  async function notify(task) {
+    if (notifyUrl === undefined) {
+      await patchTask(task, { notify: { state: 'unsupported', attempts: 0 } })
+      return
+    }
+    let attempts = 0
+    let lastError
+    while (attempts < NOTIFY_ATTEMPTS) {
+      attempts += 1
+      try {
+        const response = await fetch(notifyUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            taskId: task.taskId,
+            sessionId: task.sessionId,
+            workspace: task.workspace,
+            status: task.status,
+            result: task.result,
+            delivery: task.delivery,
+          }),
+        })
+        if (!response.ok) throw new Error(`通知端点返回 ${String(response.status)}`)
+        await patchTask(task, { notify: { state: 'sent', attempts, at: new Date().toISOString() } })
+        return
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error)
+        await new Promise((resolve) => setTimeout(resolve, 50 * attempts))
+      }
+    }
+    await patchTask(task, { notify: { state: 'failed', attempts, error: lastError } })
+  }
+
+  // ---------- 目标解析 ----------
+
   function pickMain(candidates, workspacePath) {
     const sorted = [...candidates].sort((left, right) => {
       const byTime = (right.updatedAt ?? 0) - (left.updatedAt ?? 0)
-      if (byTime !== 0) return byTime
-      return String(left.sessionId).localeCompare(String(right.sessionId))
+      return byTime !== 0 ? byTime : String(left.sessionId).localeCompare(String(right.sessionId))
     })
-
     const boundId = bindings.get(workspacePath)
     if (boundId !== undefined) {
       const bound = sorted.find((row) => row.sessionId === boundId)
-      // 绑定仍然有效：该会话仍存在且仍可投递
       if (bound !== undefined) return { picked: bound, rule: 'bound' }
-      // 绑定失效：清掉，走重新解析
       bindings.delete(workspacePath)
     }
-
     const running = sorted.find((row) => row.running === true)
     if (running !== undefined) return { picked: running, rule: 'running' }
-
     const engaged = sorted.find((row) => row.blank !== true)
     if (engaged !== undefined) return { picked: engaged, rule: 'recent-active' }
-
     if (sorted.length > 0) return { picked: sorted[0], rule: 'recent-any' }
     return { picked: undefined, rule: 'none' }
   }
@@ -277,29 +468,19 @@ export function apply(ctx, config = {}) {
     }
     const controller = requireSessionController()
     const created =
-      workspaceId === undefined
-        ? await controller.create({ cwd: workspacePath })
-        : await controller.create({ workspaceId })
+      workspaceId === undefined ? await controller.create({ cwd: workspacePath }) : await controller.create({ workspaceId })
     if (typeof created?.sessionId !== 'string') {
       throw httpError(502, 'create-failed', '新建会话失败：宿主未返回 sessionId')
     }
     return created.sessionId
   }
 
-  /**
-   * 决定这条消息投给谁。不猜 id，不盲目投递。
-   * @returns {Promise<{ sessionId: string, selection: object }>}
-   */
   async function resolveTarget(body) {
-    // 1) 显式 sessionId：精确投递，但拒绝子会话与不可投递会话
     if (typeof body.sessionId === 'string' && body.sessionId.trim() !== '') {
       const sessionId = body.sessionId.trim()
-      const archived = archivedIds()
       const row = (await rawRows()).find((candidate) => candidate?.sessionId === sessionId)
-      if (row === undefined) {
-        throw httpError(404, 'session-not-found', `会话不存在: ${sessionId}`, { sessionId })
-      }
-      const info = classify(row, archived)
+      if (row === undefined) throw httpError(404, 'session-not-found', `会话不存在: ${sessionId}`, { sessionId })
+      const info = classify(row, archivedIds())
       if (!info.deliverable) {
         throw httpError(409, 'session-not-deliverable', `会话 ${sessionId} 不可直接投递：${info.reason}`, {
           sessionId,
@@ -310,14 +491,12 @@ export function apply(ctx, config = {}) {
       return { sessionId, selection: { rule: 'explicit', candidateCount: 1 } }
     }
 
-    // 2) workspace：在该目录下挑主会话，没有就新建
     const workspacePath =
       typeof body.workspace === 'string' && body.workspace.trim() !== ''
         ? body.workspace.trim()
         : typeof body.cwd === 'string' && body.cwd.trim() !== ''
           ? body.cwd.trim()
           : undefined
-
     if (workspacePath === undefined) {
       throw httpError(400, 'bad-request', '必须提供 sessionId，或 workspace（项目目录的绝对路径）')
     }
@@ -336,7 +515,6 @@ export function apply(ctx, config = {}) {
         selection: { rule: 'created', candidateCount: 0, excludedCount: excluded, workspace: workspacePath },
       }
     }
-
     const { picked, rule } = pickMain(candidates, workspacePath)
     return {
       sessionId: picked.sessionId,
@@ -351,43 +529,6 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** 投递一条消息，返回目标会话、requestId、游标与选择依据。 */
-  async function deliver(body, signal) {
-    const text = requireString(body.text, 'text')
-    const target = await resolveTarget(body)
-    const requestId =
-      typeof body.requestId === 'string' && body.requestId !== '' ? body.requestId : randomUUID()
-    const request = {
-      sessionId: target.sessionId,
-      content: [{ type: 'text', text }],
-      requestId,
-      ...(body.mode === 'steer' ? { mode: 'steer' } : {}),
-    }
-
-    const controller = requireSessionController()
-    try {
-      await controller.prompt(request, signal)
-    } catch (error) {
-      // 投递被宿主拒绝：给出原因，并且不建立/不保留绑定
-      if (target.selection?.workspace !== undefined) bindings.delete(target.selection.workspace)
-      throw httpError(
-        409,
-        'delivery-rejected',
-        `宿主拒绝了这次投递: ${error instanceof Error ? error.message : String(error)}`,
-        { sessionId: target.sessionId, code: error?.code },
-      )
-    }
-
-    // 只有宿主确认接受后才建立绑定
-    if (target.selection?.workspace !== undefined) {
-      bindings.set(target.selection.workspace, target.sessionId)
-    }
-
-    const session = ctx.get('sessions')?.get?.(target.sessionId)
-    const afterSeq = typeof session?.seq === 'number' ? session.seq - 1 : -1
-    return { ...target, requestId, afterSeq }
-  }
-
   async function safeState(sessionId) {
     const controller = ctx.get('sessionController')
     if (typeof controller?.state !== 'function') return undefined
@@ -398,14 +539,79 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  // ---------- 派活 ----------
+
+  async function deliver(body, signal) {
+    const text = requireString(body.text, 'text')
+    const target = await resolveTarget(body)
+    const requestId =
+      typeof body.requestId === 'string' && body.requestId !== '' ? body.requestId : randomUUID()
+    const controller = requireSessionController()
+
+    const task = {
+      taskId: `task-${randomUUID()}`,
+      requestId,
+      sessionId: target.sessionId,
+      workspace: target.selection?.workspace ?? null,
+      selection: target.selection,
+      text,
+      status: 'queued',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      startedAt: null,
+      finishedAt: null,
+      afterSeq: -1,
+      endSeq: null,
+      attribution: null,
+      result: null,
+      delivery: null,
+      notify: { state: 'pending', attempts: 0 },
+      error: null,
+    }
+
+    try {
+      await controller.prompt(
+        { sessionId: target.sessionId, content: [{ type: 'text', text }], requestId, ...(body.mode === 'steer' ? { mode: 'steer' } : {}) },
+        signal,
+      )
+    } catch (error) {
+      if (target.selection?.workspace !== undefined) bindings.delete(target.selection.workspace)
+      task.status = 'failed'
+      task.finishedAt = new Date().toISOString()
+      task.error = {
+        code: typeof error?.code === 'string' ? error.code : 'delivery-rejected',
+        message: error instanceof Error ? error.message : String(error),
+      }
+      await persist(task)
+      throw httpError(409, 'delivery-rejected', `宿主拒绝了这次投递: ${task.error.message}`, {
+        sessionId: target.sessionId,
+        taskId: task.taskId,
+        code: task.error.code,
+      })
+    }
+
+    if (target.selection?.workspace !== undefined) bindings.set(target.selection.workspace, target.sessionId)
+
+    const session = ctx.get('sessions')?.get?.(target.sessionId)
+    task.afterSeq = typeof session?.seq === 'number' ? session.seq - 1 : -1
+    task.status = 'running'
+    task.startedAt = new Date().toISOString()
+    tasks.set(task.taskId, task)
+    markPending(task)
+    await persist(task)
+
+    return { taskId: task.taskId, requestId, sessionId: target.sessionId, selection: target.selection, afterSeq: task.afterSeq }
+  }
+
+  // ---------- 路由 ----------
+
   async function handle(req, res) {
     const url = new URL(req.url ?? '/', `http://${host}:${String(port)}`)
 
     if (req.method === 'GET' && url.pathname === '/health') {
-      sendJson(res, 200, { ok: true, name: NAME, version: VERSION })
+      sendJson(res, 200, { ok: true, name: NAME, version: VERSION, tasks: tasks.size, notify: notifyUrl === undefined ? 'unsupported' : 'configured' })
       return
     }
-
     if (!authorized(req)) {
       sendJson(res, 401, failure('unauthorized', '缺少或错误的 Bearer token'))
       return
@@ -417,92 +623,119 @@ export function apply(ctx, config = {}) {
       sendJson(res, 200, {
         ok: true,
         total: rows.length,
-        workspaces: rows.map((workspace) => ({
-          workspaceId: workspace?.id,
-          path: workspace?.path,
-          ...(workspace?.title === undefined ? {} : { title: workspace.title }),
-        })),
+        workspaces: rows.map((workspace) => ({ workspaceId: workspace?.id, path: workspace?.path, ...(workspace?.title === undefined ? {} : { title: workspace.title }) })),
       })
       return
     }
 
     if (req.method === 'GET' && url.pathname === '/sessions') {
-      const query = url.searchParams.get('query') ?? undefined
-      const cwd = url.searchParams.get('cwd') ?? undefined
-      const sessions = await listSessions({ query, cwd })
-      sendJson(res, 200, {
-        ok: true,
-        total: sessions.length,
-        deliverable: sessions.filter((row) => row.deliverable === true).length,
-        sessions,
+      const sessions = await listSessions({
+        query: url.searchParams.get('query') ?? undefined,
+        cwd: url.searchParams.get('cwd') ?? undefined,
       })
+      sendJson(res, 200, { ok: true, total: sessions.length, deliverable: sessions.filter((row) => row.deliverable === true).length, sessions })
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/tasks') {
+      const sessionId = url.searchParams.get('sessionId') ?? undefined
+      const workspace = url.searchParams.get('workspace') ?? undefined
+      const status = url.searchParams.get('status') ?? undefined
+      const limit = Number(url.searchParams.get('limit') ?? 50)
+      let rows = [...tasks.values()]
+      if (sessionId !== undefined) rows = rows.filter((task) => task.sessionId === sessionId)
+      if (workspace !== undefined) rows = rows.filter((task) => task.workspace === workspace)
+      if (status !== undefined) rows = rows.filter((task) => task.status === status)
+      rows.sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)))
+      sendJson(res, 200, { ok: true, total: rows.length, tasks: rows.slice(0, Number.isFinite(limit) ? limit : 50) })
+      return
+    }
+
+    const taskMatch = /^\/tasks\/([^/]+)$/.exec(url.pathname)
+    if (req.method === 'GET' && taskMatch !== null) {
+      const task = tasks.get(decodeURIComponent(taskMatch[1]))
+      if (task === undefined) {
+        sendJson(res, 404, failure('task-not-found', '没有这个任务'))
+        return
+      }
+      sendJson(res, 200, { ok: true, task })
       return
     }
 
     if (req.method === 'POST' && url.pathname === '/send') {
-      const body = await readJsonBody(req)
-      const receipt = await deliver(body, new AbortController().signal)
+      const receipt = await deliver(await readJsonBody(req), new AbortController().signal)
       sendJson(res, 202, { ok: true, status: 'accepted', ...receipt })
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/wait') {
+      const body = await readJsonBody(req)
+      const taskId = requireString(body.taskId, 'taskId')
+      const task = tasks.get(taskId)
+      if (task === undefined) throw httpError(404, 'task-not-found', '没有这个任务', { taskId })
+      if (TERMINAL.has(task.status)) {
+        sendJson(res, 200, { ok: true, timedOut: false, task })
+        return
+      }
+      const timeoutMs = Number.isSafeInteger(body.timeoutMs) && body.timeoutMs > 0 ? body.timeoutMs : DEFAULT_WAIT_MS
+      const settled = await new Promise((resolve) => {
+        const set = waiters.get(taskId) ?? new Set()
+        set.add(resolve)
+        waiters.set(taskId, set)
+        const timer = setTimeout(() => {
+          set.delete(resolve)
+          if (set.size === 0) waiters.delete(taskId)
+          resolve(undefined)
+        }, timeoutMs)
+        timer.unref?.()
+      })
+      const current = settled ?? tasks.get(taskId)
+      // 超时不取消、不重发，只如实报告当前状态
+      sendJson(res, 200, { ok: true, timedOut: settled === undefined, task: current })
       return
     }
 
     if (req.method === 'POST' && url.pathname === '/ask') {
       const body = await readJsonBody(req)
-      const timeoutMs =
-        Number.isSafeInteger(body.timeoutMs) && body.timeoutMs > 0 ? body.timeoutMs : DEFAULT_WAIT_MS
-      const maxMessages =
-        Number.isSafeInteger(body.maxMessages) && body.maxMessages > 0
-          ? body.maxMessages
-          : DEFAULT_MAX_MESSAGES
+      const receipt = await deliver(body, new AbortController().signal)
+      const task = tasks.get(receipt.taskId)
+      const timeoutMs = Number.isSafeInteger(body.timeoutMs) && body.timeoutMs > 0 ? body.timeoutMs : DEFAULT_WAIT_MS
+      const deadline = Date.now() + timeoutMs
 
-      const abort = new AbortController()
-      const guard = setTimeout(() => abort.abort(), timeoutMs + 15_000)
-      try {
-        const { sessionId, requestId, afterSeq, selection } = await deliver(body, abort.signal)
+      while (Date.now() < deadline) {
+        if (TERMINAL.has(task.status)) break
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
 
-        let result
-        try {
-          result = await requireSessionController().wait(
-            { sessionId, afterSeq, timeoutMs, maxMessages },
-            abort.signal,
-          )
-        } catch (error) {
-          const code = error?.code
-          if (code === 'session/wait-timeout' || error?.name === 'AbortError' || code === 'ABORT_ERR') {
-            // 关键：等待超时不重发。消息已经在跑，报告“仍在运行”并交还 id。
-            const state = await safeState(sessionId)
-            sendJson(res, 200, {
-              ok: true,
-              status: state?.running === true ? 'running' : 'unknown',
-              sessionId,
-              requestId,
-              selection,
-              reason: 'timeout',
-              text: '',
-              message:
-                state?.running === true
-                  ? '消息已被接受且会话仍在运行；本次没有重发，请稍后用同一 sessionId 查询结果'
-                  : '等待超时，当前无法确认会话状态；本次没有重发，请稍后用同一 sessionId 查询',
-            })
-            return
-          }
-          throw error
-        }
-
-        const records = result?.output?.records
+      if (TERMINAL.has(task.status)) {
         sendJson(res, 200, {
           ok: true,
           status: 'completed',
-          sessionId,
-          requestId,
-          selection,
-          reason: result?.reason,
-          text: assistantText(records),
-          truncated: result?.output?.truncated === true,
+          taskId: task.taskId,
+          sessionId: task.sessionId,
+          requestId: task.requestId,
+          selection: task.selection,
+          reason: task.result?.reason ?? 'idle',
+          text: task.result?.text ?? '',
+          attribution: task.attribution,
+          delivery: task.delivery,
+          truncated: task.result?.truncated === true,
         })
-      } finally {
-        clearTimeout(guard)
+        return
       }
+
+      const state = await safeState(task.sessionId)
+      sendJson(res, 200, {
+        ok: true,
+        status: state?.running === true ? 'running' : 'unknown',
+        taskId: task.taskId,
+        sessionId: task.sessionId,
+        requestId: task.requestId,
+        selection: task.selection,
+        reason: 'timeout',
+        text: '',
+        message: '消息已被接受且会话仍在运行；本次没有重发。请用 dsh_result / dsh_wait 按 taskId 取结果，不要再发一遍同样的任务。',
+      })
       return
     }
 
@@ -514,23 +747,26 @@ export function apply(ctx, config = {}) {
       const status = typeof error?.status === 'number' ? error.status : 500
       const code = typeof error?.code === 'string' ? error.code : 'relay-error'
       const message = error instanceof Error ? error.message : String(error)
-      const details = error?.details
-      if (!res.headersSent) sendJson(res, status, failure(code, message, details))
+      if (!res.headersSent) sendJson(res, status, failure(code, message, error?.details))
       else res.end()
     })
   })
-
   server.on('error', (error) => {
     console.error(`[${NAME}] 监听 ${host}:${String(port)} 失败: ${error.message}`)
   })
 
+  let timer
   ctx.effect(() => {
-    server.listen(port, host, () => {
-      console.log(
-        `[${NAME}] 已就绪 http://${host}:${String(port)}  (GET /health /workspaces /sessions, POST /send /ask)`,
-      )
+    void loadTasks().then(() => {
+      console.log(`[${NAME}] 已载入 ${String(tasks.size)} 个历史任务`)
     })
+    server.listen(port, host, () => {
+      console.log(`[${NAME}] 已就绪 http://${host}:${String(port)}  v${VERSION}`)
+    })
+    timer = setInterval(() => void tick(), tickMs)
+    timer.unref?.()
     return () => {
+      if (timer !== undefined) clearInterval(timer)
       server.close()
     }
   })
