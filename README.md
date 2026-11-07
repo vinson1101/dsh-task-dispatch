@@ -1,4 +1,4 @@
-# dsh-session-relay
+# dsh-task-dispatch
 
 Deliver a message to a real DSH session **by session id**, and optionally wait for its reply.
 
@@ -18,16 +18,16 @@ This plugin deliberately declares no host packages, so that class of conflict ca
 
 ```bash
 # local directory (development)
-dsh plugin --profile desktop add /absolute/path/dsh-session-relay
+dsh plugin --profile desktop add /absolute/path/dsh-task-dispatch
 
 # after publishing
-dsh plugin --profile desktop add dsh-session-relay@latest
+dsh plugin --profile desktop add dsh-task-dispatch@latest
 ```
 
 Restart DSH; the log shows:
 
 ```
-[dsh-session-relay] ready http://127.0.0.1:7391
+[dsh-task-dispatch] ready http://127.0.0.1:7391
 ```
 
 ## Configuration

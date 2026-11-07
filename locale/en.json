@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Session relay",
-    "description": "Deliver a message to any real DSH session by session id over localhost, and wait for its reply."
+    "title": "Task dispatch",
+    "description": "Dispatch a task to a real DSH session by workspace or session id, with a persistent task ledger, read-only result lookup and waiting."
   }
 }

@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "会话中继",
-    "description": "通过本机端口按 session id 向真实的 DSH 会话投递消息，并等待它的回复。"
+    "title": "任务派发",
+    "description": "按工作空间或会话 id 给真实的 DSH 会话派发任务，并提供持久任务台账、只读结果查询与等待。"
   }
 }

@@ -1,4 +1,4 @@
-# dsh-session-relay · 会话中继
+# dsh-task-dispatch · 任务派发
 
 按 **session id** 给一个真实的 DSH 会话投递消息，并（可选）同步等它回话。
 
@@ -18,19 +18,19 @@
 
 ```bash
 # 从 npm 安装（发布后）
-dsh plugin --profile desktop add dsh-session-relay@latest
+dsh plugin --profile desktop add dsh-task-dispatch@latest
 
 # 从本地目录安装（开发时，软链，改代码即时生效）
-dsh plugin --profile desktop add /绝对路径/dsh-session-relay
+dsh plugin --profile desktop add /绝对路径/dsh-task-dispatch
 
 # 从本地 tarball 安装（等价于正式包，需要重启生效）
-npm pack && dsh plugin --profile desktop add /绝对路径/dsh-session-relay-0.5.0.tgz
+npm pack && dsh plugin --profile desktop add /绝对路径/dsh-task-dispatch-0.5.0.tgz
 ```
 
 安装后重启 DSH，日志里会出现：
 
 ```
-[dsh-session-relay] 已就绪 http://127.0.0.1:7391
+[dsh-task-dispatch] 已就绪 http://127.0.0.1:7391
 ```
 
 ## 配置
@@ -102,6 +102,10 @@ curl -s -X POST http://127.0.0.1:7391/send \
 - 默认只监听 `127.0.0.1`，代码里硬性拒绝非回环地址
 - 同一台机器上的任何进程都能调用，**对外暴露前务必设置 `token`**
 - 它能驱动真实的 agent，也就意味着能间接执行命令、改文件——当成本机 shell 级别的权限对待
+
+## 数据目录
+
+任务台账默认落在 `$DSH_HOME/relay/tasks/`（沿用旧目录名，保证升级后历史任务仍可查）。
 
 ## 回传：目前**不支持**主动回调
 

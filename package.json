@@ -1,7 +1,7 @@
 {
-  "name": "dsh-session-relay",
-  "version": "0.5.0",
-  "description": "向真实的 DSH 会话按工作空间或 session id 投递消息并等待回复的本地 HTTP 中继，零依赖",
+  "name": "dsh-task-dispatch",
+  "version": "0.6.0",
+  "description": "按工作空间给真实的 DSH 会话派发任务，带持久任务台账、只读结果查询与等待，零依赖",
   "type": "module",
   "license": "MIT",
   "scripts": {
@@ -25,9 +25,10 @@
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
-    "session",
-    "relay",
-    "mcp"
+    "dispatch",
+    "task",
+    "workspace",
+    "agent"
   ],
   "dsh": {
     "bundle": {

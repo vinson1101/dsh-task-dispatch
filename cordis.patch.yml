@@ -1,6 +1,6 @@
 - insert:
-    - id: session-relay
-      name: 'dsh-session-relay'
+    - id: task-dispatch
+      name: 'dsh-task-dispatch'
       config:
         host: 127.0.0.1
         port: 7391
