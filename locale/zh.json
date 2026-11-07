@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "会话中继",
+    "description": "通过本机端口按 session id 向真实的 DSH 会话投递消息，并等待它的回复。"
+  }
+}

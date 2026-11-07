@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session relay",
+    "description": "Deliver a message to any real DSH session by session id over localhost, and wait for its reply."
+  }
+}

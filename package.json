@@ -1,0 +1,37 @@
+{
+  "name": "dsh-session-relay",
+  "version": "0.2.0",
+  "description": "向真实的 DSH 会话按工作空间或 session id 投递消息并等待回复的本地 HTTP 中继，零依赖",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/relay.test.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "session",
+    "relay",
+    "mcp"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

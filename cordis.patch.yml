@@ -1,0 +1,6 @@
+- insert:
+    - id: session-relay
+      name: 'dsh-session-relay'
+      config:
+        host: 127.0.0.1
+        port: 7391
