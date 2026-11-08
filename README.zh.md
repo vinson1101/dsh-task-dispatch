@@ -27,21 +27,36 @@ codex mcp list
 
 ## 安装
 
+**尚未发布到 npm**，从 GitHub 安装：
+
 ```bash
-# 从 npm 安装（发布后）
-dsh plugin --profile desktop add dsh-task-dispatch@latest
+# 方式一：release 里的打包文件（推荐，等价于正式包）
+dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.0/dsh-task-dispatch-0.6.0.tgz
 
-# 从本地目录安装（开发时，软链，改代码即时生效）
+# 方式二：直接从 git 仓库安装（会带上 mcp/ 和 test/，体积略大）
+dsh plugin --profile desktop add github:vinson1101/dsh-task-dispatch
+
+# 方式三：本地目录（开发时，软链，改代码即时生效）
 dsh plugin --profile desktop add /绝对路径/dsh-task-dispatch
-
-# 从本地 tarball 安装（等价于正式包，需要重启生效）
-npm pack && dsh plugin --profile desktop add /绝对路径/dsh-task-dispatch-0.5.0.tgz
 ```
 
-安装后重启 DSH，日志里会出现：
+安装后重启 DSH，日志里出现：
 
 ```
 [dsh-task-dispatch] 已就绪 http://127.0.0.1:7391
+```
+
+### 30 秒验证
+
+```bash
+curl -s http://127.0.0.1:7391/health
+# {"ok":true,"name":"dsh-task-dispatch","version":"0.6.0",...}
+
+curl -s -X POST http://127.0.0.1:7391/send \
+  -H 'content-type: application/json' \
+  -d '{"workspace":"/你的项目路径","text":"只回复两个字：收到"}'
+
+curl -s http://127.0.0.1:7391/tasks/<上一步返回的 taskId>
 ```
 
 ## 配置

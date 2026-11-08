@@ -27,18 +27,36 @@ Codex then gets `dsh_send` / `dsh_ask` / `dsh_result` / `dsh_wait` / `dsh_tasks`
 
 ## Install
 
-```bash
-# local directory (development)
-dsh plugin --profile desktop add /absolute/path/dsh-task-dispatch
+**Not published to npm yet.** Install from GitHub:
 
-# after publishing
-dsh plugin --profile desktop add dsh-task-dispatch@latest
+```bash
+# Option 1: the packed artifact from a release (recommended)
+dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.0/dsh-task-dispatch-0.6.0.tgz
+
+# Option 2: straight from git (pulls mcp/ and test/ too)
+dsh plugin --profile desktop add github:vinson1101/dsh-task-dispatch
+
+# Option 3: a local directory (development; symlinked, edits apply immediately)
+dsh plugin --profile desktop add /absolute/path/dsh-task-dispatch
 ```
 
-Restart DSH; the log shows:
+Restart DSH afterwards; the log shows:
 
 ```
 [dsh-task-dispatch] ready http://127.0.0.1:7391
+```
+
+### 30-second check
+
+```bash
+curl -s http://127.0.0.1:7391/health
+# {"ok":true,"name":"dsh-task-dispatch","version":"0.6.0",...}
+
+curl -s -X POST http://127.0.0.1:7391/send \
+  -H 'content-type: application/json' \
+  -d '{"workspace":"/your/project","text":"reply with the single word: ok"}'
+
+curl -s http://127.0.0.1:7391/tasks/<taskId-from-the-previous-call>
 ```
 
 ## Configuration
