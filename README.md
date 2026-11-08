@@ -14,6 +14,17 @@ It removes the human copy-paste relay between two agents: Codex, a script, or CI
 
 This plugin deliberately declares no host packages, so that class of conflict cannot happen. The trade-off: it only sends and waits — no file tools, approval bridge, or preset management.
 
+## Use from Codex (MCP)
+
+The plugin only speaks HTTP. To expose it as Codex tools, use the bundled `mcp/` adapter:
+
+```bash
+codex mcp add dsh -- node /absolute/path/dsh-task-dispatch/mcp/index.mjs
+codex mcp list
+```
+
+Codex then gets `dsh_send` / `dsh_ask` / `dsh_result` / `dsh_wait` / `dsh_tasks` / `dsh_sessions` / `dsh_workspaces`.
+
 ## Install
 
 ```bash

@@ -1,11 +1,11 @@
 {
-  "name": "dsh-relay-mcp",
-  "version": "0.3.0",
-  "description": "MCP stdio server exposing dsh-session-relay as tools: send to a DSH session by id, ask and wait for its reply",
+  "name": "dsh-task-dispatch-mcp",
+  "version": "0.4.0",
+  "description": "MCP stdio 适配层：把 dsh-task-dispatch 的 HTTP 接口变成 Codex 等 MCP 客户端可调用的工具",
   "type": "module",
   "license": "MIT",
   "bin": {
-    "dsh-relay-mcp": "./index.mjs"
+    "dsh-task-dispatch-mcp": "./index.mjs"
   },
   "files": [
     "index.mjs",

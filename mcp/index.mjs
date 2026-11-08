@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dsh-relay-mcp — 把 dsh-session-relay 的 HTTP 接口包成 MCP 工具。
+ * dsh-task-dispatch-mcp — 把 dsh-session-relay 的 HTTP 接口包成 MCP 工具。
  *
  * 零依赖：只用 Node 内置模块 + 全局 fetch（Node >= 18）。
  * 通过 stdio 与 MCP 客户端（Codex 等）通信，每条消息一行 JSON。
@@ -14,7 +14,7 @@ import { createInterface } from 'node:readline'
 
 const RELAY_URL = (process.env.DSH_RELAY_URL ?? 'http://127.0.0.1:7391').replace(/\/+$/, '')
 const RELAY_TOKEN = process.env.DSH_RELAY_TOKEN ?? ''
-const SERVER_INFO = { name: 'dsh-relay', version: '0.3.0' }
+const SERVER_INFO = { name: 'dsh-task-dispatch-mcp', version: '0.4.0' }
 const SUPPORTED_PROTOCOLS = ['2024-11-05', '2025-03-26', '2025-06-18']
 const DEFAULT_PROTOCOL = '2025-06-18'
 

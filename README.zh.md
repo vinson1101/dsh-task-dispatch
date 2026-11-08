@@ -14,6 +14,17 @@
 
 本插件刻意不依赖任何宿主包，因此**不会**出现这种冲突。代价是它只做"投递 + 等待"这一件事，不做文件工具、审批桥、预设管理。
 
+## 给 Codex 用（MCP）
+
+插件只提供 HTTP 接口。要让 Codex 直接当工具调用，用仓库内的 `mcp/` 适配层：
+
+```bash
+codex mcp add dsh -- node /绝对路径/dsh-task-dispatch/mcp/index.mjs
+codex mcp list
+```
+
+之后 Codex 里就有 `dsh_send` / `dsh_ask` / `dsh_result` / `dsh_wait` / `dsh_tasks` / `dsh_sessions` / `dsh_workspaces`。
+
 ## 安装
 
 ```bash

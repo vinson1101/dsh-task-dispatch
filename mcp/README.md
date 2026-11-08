@@ -1,6 +1,6 @@
-# dsh-relay-mcp
+# dsh-task-dispatch-mcp
 
-把 [`dsh-session-relay`](../dsh-session-relay) 的本地 HTTP 接口包成 MCP 工具，让 Codex（或任何 MCP 客户端）能直接给一个真实的 DSH 会话派活。
+把 [`dsh-task-dispatch`](../dsh-task-dispatch) 的本地 HTTP 接口包成 MCP 工具，让 Codex（或任何 MCP 客户端）能直接给一个真实的 DSH 会话派活。
 
 零依赖，只用 Node 内置模块和全局 `fetch`（Node >= 18）。
 
@@ -20,12 +20,12 @@
 ## 前置条件
 
 1. DSH 正在运行
-2. `dsh-session-relay` 插件已启用（默认监听 `127.0.0.1:7391`）
+2. `dsh-task-dispatch` 插件已启用（默认监听 `127.0.0.1:7391`）
 
 ## 注册到 Codex
 
 ```bash
-codex mcp add dsh -- /opt/homebrew/bin/node /绝对路径/dsh-relay-mcp/index.mjs
+codex mcp add dsh -- /opt/homebrew/bin/node /绝对路径/dsh-task-dispatch-mcp/index.mjs
 codex mcp list   # 确认出现 dsh
 ```
 
