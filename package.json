@@ -1,6 +1,6 @@
 {
   "name": "dsh-task-dispatch",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "按工作空间给真实的 DSH 会话派发任务，带持久任务台账、只读结果查询与等待，零依赖",
   "type": "module",
   "license": "MIT",

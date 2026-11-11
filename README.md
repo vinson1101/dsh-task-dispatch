@@ -109,17 +109,23 @@ Wrap that curl in an MCP server if you want Codex to call it as a tool.
 
 ## Security
 
-- Listens on `127.0.0.1` only; non-loopback hosts are rejected in code
-- Any local process can call it, so set `token` before exposing anything
-- It drives a real agent, which can execute commands and edit files — treat it as local shell-level access
+**Authentication is required by default.** On first start the plugin generates a 32-byte token, writes it to `$DSH_HOME/relay/token` (mode `600`) and reuses it across restarts. Every endpoint except `/health` needs it:
 
-## Callback: not supported yet
+```bash
+curl -H "Authorization: Bearer $(cat ~/.dsh/relay/token)" http://127.0.0.1:7391/tasks
+```
 
-The task result is **not pushed back** to the caller. There is no MCP server→client notification implementation, and whether such a notification could wake an idle Codex session is unverified.
+Request validation, enforced in code:
 
-`notify` is a delivery *ledger*, not proof of receipt: `unsupported` / `pending` / `sending` / `sent` / `failed`. A webhook returning 200 only means the HTTP endpoint answered.
+| Check | Behaviour | Blocks |
+|---|---|---|
+| `Host` must be `127.0.0.1` / `localhost` / `[::1]` | else 403 | DNS rebinding |
+| A present `Origin` must be local | else 403 | malicious web pages |
+| `POST` must use `content-type: application/json` | else 415 | simple-form CSRF |
 
-Retrieve results by querying: `GET /tasks/:id` (`dsh_result`) or `POST /wait` (`dsh_wait`). Neither resends the task.
+- Binds loopback only; a non-loopback host throws at activation
+- Disabling auth requires an explicit `allowAnonymous: true` (logs a warning) and is **not recommended**
+- It drives a real agent, i.e. local shell-level access — do not expose the port to a LAN
 
 ## Limitations
 

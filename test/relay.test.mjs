@@ -7,7 +7,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createServer } from 'node:http'
+import { createServer, request } from 'node:http'
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -119,12 +119,12 @@ async function startRelay(options = {}) {
     },
   }
 
-  apply(ctx, {
-    port,
-    tickMs: options.tickMs ?? 15,
-    ...(state.notifyUrl === undefined ? {} : { notifyUrl: state.notifyUrl }),
-    dataDir,
-  })
+  const token = options.token === null ? undefined : (options.token ?? 'test-token')
+  const relayConfig = { port, tickMs: options.tickMs ?? 15, dataDir }
+  if (token !== undefined) relayConfig.token = token
+  if (options.allowAnonymous === true) relayConfig.allowAnonymous = true
+  if (state.notifyUrl !== undefined) relayConfig.notifyUrl = state.notifyUrl
+  apply(ctx, relayConfig)
 
   // 等端口真正可服务，避免固定 sleep 造成的启动竞态
   let ready = false
@@ -143,18 +143,44 @@ async function startRelay(options = {}) {
   if (!ready) throw new Error(`relay 未能在端口 ${port} 启动`)
 
   const base = `http://127.0.0.1:${port}`
-  const call = async (method, urlPath, body) => {
+  const call = async (method, urlPath, body, extraHeaders = {}) => {
+    const headers = { ...extraHeaders }
+    if (token !== undefined) headers.authorization = `Bearer ${token}`
+    if (body !== undefined) headers['content-type'] = headers['content-type'] ?? 'application/json'
     const response = await fetch(base + urlPath, {
       method,
-      headers: body === undefined ? {} : { 'content-type': 'application/json' },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     })
     return { status: response.status, json: await response.json() }
   }
 
+  /** 用 node:http 直接发请求，才能伪造 Host 头（fetch 不允许）。 */
+  const rawCall = (opts = {}) =>
+    new Promise((resolve, reject) => {
+      const req = request(
+        {
+          host: '127.0.0.1',
+          port,
+          method: opts.method ?? 'GET',
+          path: opts.path ?? '/tasks',
+          headers: opts.headers ?? {},
+        },
+        (res) => {
+          let data = ''
+          res.on('data', (chunk) => (data += chunk))
+          res.on('end', () => resolve({ status: res.statusCode, body: data }))
+        },
+      )
+      req.on('error', reject)
+      req.end(opts.body)
+    })
+
   return {
     state,
     call,
+    rawCall,
+    token,
     close() {
       for (const dispose of disposers) {
         try {
@@ -549,6 +575,123 @@ test('dsh_wait 超时：不取消、不重发', async () => {
     assert.equal(waited.json.timedOut, true)
     assert.equal(waited.json.task.status, 'running')
     assert.equal(relay.state.promptCalls.length, 1)
+  } finally {
+    relay.close()
+    await relay.cleanup()
+  }
+})
+
+// ---------- 安全：认证与请求校验 ----------
+
+const authHeaders = (relay) => ({ authorization: `Bearer ${relay.token}` })
+
+test('安全：不带令牌访问任务接口 → 401', async () => {
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)] })
+  try {
+    const res = await relay.rawCall({ path: '/tasks' })
+    assert.equal(res.status, 401)
+    assert.equal(JSON.parse(res.body).error.code, 'unauthorized')
+  } finally {
+    relay.close()
+    await relay.cleanup()
+  }
+})
+
+test('安全：错误令牌 → 401，正确令牌 → 200', async () => {
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)] })
+  try {
+    const bad = await relay.rawCall({ path: '/tasks', headers: { authorization: 'Bearer nope' } })
+    assert.equal(bad.status, 401)
+    const good = await relay.rawCall({ path: '/tasks', headers: authHeaders(relay) })
+    assert.equal(good.status, 200)
+  } finally {
+    relay.close()
+    await relay.cleanup()
+  }
+})
+
+test('安全：伪造 Origin → 403（挡恶意网页）', async () => {
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)] })
+  try {
+    const res = await relay.rawCall({
+      path: '/tasks',
+      headers: { ...authHeaders(relay), origin: 'https://evil.example' },
+    })
+    assert.equal(res.status, 403)
+    assert.equal(JSON.parse(res.body).error.code, 'origin-not-allowed')
+  } finally {
+    relay.close()
+    await relay.cleanup()
+  }
+})
+
+test('安全：非回环 Host → 403（挡 DNS rebinding）', async () => {
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)] })
+  try {
+    const res = await relay.rawCall({
+      path: '/tasks',
+      headers: { ...authHeaders(relay), host: 'evil.example' },
+    })
+    assert.equal(res.status, 403)
+    assert.equal(JSON.parse(res.body).error.code, 'host-not-allowed')
+  } finally {
+    relay.close()
+    await relay.cleanup()
+  }
+})
+
+test('安全：POST 非 JSON Content-Type → 415（挡简单表单 CSRF）', async () => {
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)] })
+  try {
+    const res = await relay.rawCall({
+      method: 'POST',
+      path: '/send',
+      headers: { ...authHeaders(relay), 'content-type': 'text/plain' },
+      body: JSON.stringify({ workspace: WS, text: 'x' }),
+    })
+    assert.equal(res.status, 415)
+    assert.equal(JSON.parse(res.body).error.code, 'unsupported-media-type')
+    assert.equal(relay.state.promptCalls.length, 0)
+  } finally {
+    relay.close()
+    await relay.cleanup()
+  }
+})
+
+test('安全：未配置令牌时自动生成并落盘（600），重启复用同一令牌', async () => {
+  const root = await tempDir()
+  const dataDir = path.join(root, 'relay', 'tasks')
+  const rows = [mainRow('session-main', WS)]
+
+  const first = await startRelay({ rows, dataDir, token: null })
+  const tokenPath = path.join(root, 'relay', 'token')
+  const token1 = (await fs.readFile(tokenPath, 'utf8')).trim()
+  const mode = (await fs.stat(tokenPath)).mode & 0o777
+  first.close()
+  assert.equal(token1.length, 64, '令牌长度应为 64 hex')
+  assert.equal(mode, 0o600, '令牌文件权限应为 600')
+
+  const second = await startRelay({ rows, dataDir, token: null })
+  try {
+    const token2 = (await fs.readFile(tokenPath, 'utf8')).trim()
+    assert.equal(token2, token1, '重启后应复用同一令牌')
+    const ok = await second.rawCall({ path: '/tasks', headers: { authorization: `Bearer ${token2}` } })
+    assert.equal(ok.status, 200)
+    const health = await second.call('GET', '/health')
+    assert.equal(health.json.auth, 'token')
+  } finally {
+    second.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('安全：显式 allowAnonymous 才放行，并标记 auth=none', async () => {
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)], token: null, allowAnonymous: true })
+  try {
+    const res = await relay.rawCall({ path: '/tasks' })
+    assert.equal(res.status, 200)
+    const health = await relay.call('GET', '/health')
+    assert.equal(health.json.auth, 'none')
   } finally {
     relay.close()
     await relay.cleanup()

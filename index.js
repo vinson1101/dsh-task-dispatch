@@ -10,16 +10,16 @@
  */
 
 import { createServer } from 'node:http'
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { promises as fs } from 'node:fs'
+import { promises as fs, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-const VERSION = '0.6.0'
+const VERSION = '0.6.1'
 const NAME = 'dsh-task-dispatch'
 const MAX_BODY_BYTES = 1024 * 1024
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost'])
@@ -118,18 +118,48 @@ export function attributeTurn(events, ourSeq) {
 export function apply(ctx, config = {}) {
   const port = Number(config.port ?? 7391)
   const host = String(config.host ?? '127.0.0.1')
-  const token =
-    typeof config.token === 'string' && config.token.trim() !== '' ? config.token.trim() : undefined
   const tickMs = Number.isInteger(config.tickMs) && config.tickMs > 0 ? config.tickMs : 2000
   const notifyUrl =
     typeof config.notifyUrl === 'string' && config.notifyUrl.trim() !== '' ? config.notifyUrl.trim() : undefined
+  const allowAnonymous = config.allowAnonymous === true
   const dataDir =
     typeof config.dataDir === 'string' && config.dataDir.trim() !== ''
       ? config.dataDir.trim()
       : path.join(process.env.DSH_HOME ?? path.join(homedir(), '.dsh'), 'relay', 'tasks')
+  const tokenFile = path.join(path.dirname(dataDir), 'token')
 
   if (!LOOPBACK_HOSTS.has(host)) throw new Error(`${NAME}: host 只能是回环地址，收到 "${host}"`)
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`${NAME}: 端口非法`)
+
+  /**
+   * 令牌解析：显式配置优先；否则读 token 文件；都没有就生成一个并落盘。
+   * 默认必须认证——早期版本无认证是安全缺陷，这里不再允许。
+   */
+  const token = (() => {
+    if (typeof config.token === 'string' && config.token.trim() !== '') return config.token.trim()
+    if (allowAnonymous) return undefined
+    try {
+      const existing = readFileSync(tokenFile, 'utf8').trim()
+      if (existing !== '') return existing
+    } catch {
+      // 文件不存在，继续生成
+    }
+    const generated = randomBytes(32).toString('hex')
+    try {
+      mkdirSync(path.dirname(tokenFile), { recursive: true, mode: 0o700 })
+      writeFileSync(tokenFile, `${generated}\n`, { mode: 0o600 })
+      console.log(`[${NAME}] 已生成访问令牌: ${tokenFile}（权限 600）`)
+    } catch (error) {
+      console.error(
+        `[${NAME}] 无法写入令牌文件 ${tokenFile}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+    return generated
+  })()
+
+  if (token === undefined) {
+    console.warn(`[${NAME}] 警告：allowAnonymous 已开启，本机任何进程都可调用本服务`)
+  }
 
   /** taskId → task */
   const tasks = new Map()
@@ -162,6 +192,35 @@ export function apply(ctx, config = {}) {
     const supplied = Buffer.from(header.slice('Bearer '.length).trim(), 'utf8')
     const expected = Buffer.from(token, 'utf8')
     return supplied.byteLength === expected.byteLength && supplied.equals(expected)
+  }
+
+  /**
+   * Host 必须是回环地址。浏览器发起跨站请求时无法自由伪造 Host，
+   * 这条能挡住 DNS rebinding：恶意域名解析到 127.0.0.1 也过不了。
+   */
+  function hostAllowed(req) {
+    const raw = req.headers.host
+    if (typeof raw !== 'string') return false
+    return /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(raw)
+  }
+
+  /** 浏览器会自动带 Origin；非本机来源一律拒绝，命令行客户端不带 Origin 则放行。 */
+  function originAllowed(req) {
+    const origin = req.headers.origin
+    if (origin === undefined) return true
+    try {
+      const url = new URL(origin)
+      return ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(url.hostname)
+    } catch {
+      return false
+    }
+  }
+
+  /** POST 必须声明 JSON：普通表单无法设置该 Content-Type，挡掉简单表单 CSRF。 */
+  function contentTypeAllowed(req) {
+    if (req.method !== 'POST') return true
+    const raw = req.headers['content-type']
+    return typeof raw === 'string' && raw.toLowerCase().startsWith('application/json')
   }
 
   function archivedIds() {
@@ -776,12 +835,30 @@ export function apply(ctx, config = {}) {
   async function handle(req, res) {
     const url = new URL(req.url ?? '/', `http://${host}:${String(port)}`)
 
-    if (req.method === 'GET' && url.pathname === '/health') {
-      sendJson(res, 200, { ok: true, name: NAME, version: VERSION, tasks: tasks.size, notify: notifyUrl === undefined ? 'unsupported' : 'configured' })
+    // 1) 先校验请求来源，再做任何事（包括 health）
+    if (!hostAllowed(req)) {
+      sendJson(res, 403, failure('host-not-allowed', 'Host 头必须是本机回环地址'))
       return
     }
+    if (!originAllowed(req)) {
+      sendJson(res, 403, failure('origin-not-allowed', '拒绝来自非本机 Origin 的请求'))
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/health') {
+      sendJson(res, 200, { ok: true, name: NAME, version: VERSION, tasks: tasks.size, auth: token === undefined ? 'none' : 'token', notify: notifyUrl === undefined ? 'unsupported' : 'configured' })
+      return
+    }
+
+    // 2) 认证：默认必须带 token
     if (!authorized(req)) {
       sendJson(res, 401, failure('unauthorized', '缺少或错误的 Bearer token'))
+      return
+    }
+
+    // 3) POST 必须声明 JSON
+    if (!contentTypeAllowed(req)) {
+      sendJson(res, 415, failure('unsupported-media-type', 'POST 必须使用 content-type: application/json'))
       return
     }
 

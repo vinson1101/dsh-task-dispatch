@@ -11,9 +11,25 @@
  */
 
 import { createInterface } from 'node:readline'
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import path from 'node:path'
+
+/** 令牌：显式环境变量优先，否则读中继生成的 token 文件。 */
+function resolveToken() {
+  const fromEnv = process.env.DSH_RELAY_TOKEN
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv.trim()
+  const file = path.join(process.env.DSH_HOME ?? path.join(homedir(), '.dsh'), 'relay', 'token')
+  try {
+    const value = readFileSync(file, 'utf8').trim()
+    return value === '' ? undefined : value
+  } catch {
+    return undefined
+  }
+}
 
 const RELAY_URL = (process.env.DSH_RELAY_URL ?? 'http://127.0.0.1:7391').replace(/\/+$/, '')
-const RELAY_TOKEN = process.env.DSH_RELAY_TOKEN ?? ''
+const RELAY_TOKEN = resolveToken() ?? ''
 const SERVER_INFO = { name: 'dsh-task-dispatch-mcp', version: '0.4.0' }
 const SUPPORTED_PROTOCOLS = ['2024-11-05', '2025-03-26', '2025-06-18']
 const DEFAULT_PROTOCOL = '2025-06-18'
@@ -169,6 +185,11 @@ async function callRelay(path, init = {}) {
   }
   if (!response.ok || body?.ok === false) {
     const detail = body?.error?.message ?? raw
+    if (response.status === 401) {
+      throw new Error(
+        `中继返回 401：缺少或错误的令牌。设置 DSH_RELAY_TOKEN，或让中继生成 $DSH_HOME/relay/token。原始信息: ${detail}`,
+      )
+    }
     throw new Error(`中继返回 ${String(response.status)}: ${detail}`)
   }
   return body
