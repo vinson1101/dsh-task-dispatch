@@ -23,6 +23,8 @@ codex mcp add dsh -- node /absolute/path/dsh-task-dispatch/mcp/index.mjs
 codex mcp list
 ```
 
+> After upgrading the plugin, **update and restart the MCP adapter too** (Codex spawns it per new session). The adapter must read the same `$DSH_HOME/relay/token`; older adapters do not send a token and will get 401.
+
 Codex then gets `dsh_send` / `dsh_ask` / `dsh_result` / `dsh_wait` / `dsh_tasks` / `dsh_sessions` / `dsh_workspaces`.
 
 ## Install
@@ -31,7 +33,7 @@ Codex then gets `dsh_send` / `dsh_ask` / `dsh_result` / `dsh_wait` / `dsh_tasks`
 
 ```bash
 # Option 1: the packed artifact from a release (recommended)
-dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.0/dsh-task-dispatch-0.6.0.tgz
+dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.2/dsh-task-dispatch-0.6.2.tgz
 
 # Option 2: straight from git (pulls mcp/ and test/ too)
 dsh plugin --profile desktop add github:vinson1101/dsh-task-dispatch
@@ -50,7 +52,7 @@ Restart DSH afterwards; the log shows:
 
 ```bash
 curl -s http://127.0.0.1:7391/health
-# {"ok":true,"name":"dsh-task-dispatch","version":"0.6.0",...}
+# {"ok":true,"name":"dsh-task-dispatch","version":"0.6.2",...}
 
 curl -s -X POST http://127.0.0.1:7391/send \
   -H 'content-type: application/json' \
@@ -65,7 +67,7 @@ curl -s http://127.0.0.1:7391/tasks/<taskId-from-the-previous-call>
 |---|---|---|
 | `host` | `127.0.0.1` | Loopback only; any other value fails activation |
 | `port` | `7391` | Listen port |
-| `token` | none | When set, requests need `Authorization: Bearer <token>` |
+| `token` | **generated** | Created on first start at `$DSH_HOME/relay/token` (mode 600); an explicit value takes precedence. See Security |
 
 ## API
 

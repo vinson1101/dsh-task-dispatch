@@ -23,6 +23,8 @@ codex mcp add dsh -- node /绝对路径/dsh-task-dispatch/mcp/index.mjs
 codex mcp list
 ```
 
+> 升级插件后，**MCP 适配层也要同步更新并重启**（Codex 会为每个新会话重新拉起它）。适配层需要读到与中继相同的 `$DSH_HOME/relay/token`，旧版适配层不认识令牌，会直接 401。
+
 之后 Codex 里就有 `dsh_send` / `dsh_ask` / `dsh_result` / `dsh_wait` / `dsh_tasks` / `dsh_sessions` / `dsh_workspaces`。
 
 ## 安装
@@ -31,7 +33,7 @@ codex mcp list
 
 ```bash
 # 方式一：release 里的打包文件（推荐，等价于正式包）
-dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.0/dsh-task-dispatch-0.6.0.tgz
+dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.2/dsh-task-dispatch-0.6.2.tgz
 
 # 方式二：直接从 git 仓库安装（会带上 mcp/ 和 test/，体积略大）
 dsh plugin --profile desktop add github:vinson1101/dsh-task-dispatch
@@ -50,7 +52,7 @@ dsh plugin --profile desktop add /绝对路径/dsh-task-dispatch
 
 ```bash
 curl -s http://127.0.0.1:7391/health
-# {"ok":true,"name":"dsh-task-dispatch","version":"0.6.0",...}
+# {"ok":true,"name":"dsh-task-dispatch","version":"0.6.2",...}
 
 curl -s -X POST http://127.0.0.1:7391/send \
   -H 'content-type: application/json' \
@@ -65,7 +67,7 @@ curl -s http://127.0.0.1:7391/tasks/<上一步返回的 taskId>
 |---|---|---|
 | `host` | `127.0.0.1` | 只接受回环地址，填别的会启动失败 |
 | `port` | `7391` | 监听端口 |
-| `token` | 无 | 设置后所有请求需带 `Authorization: Bearer <token>` |
+| `token` | **自动生成** | 首次启动生成并写入 `$DSH_HOME/relay/token`（600）；手工指定则以此为准。详见「安全」 |
 
 ## 接口
 

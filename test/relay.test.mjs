@@ -697,3 +697,51 @@ test('安全：显式 allowAnonymous 才放行，并标记 auth=none', async () 
     await relay.cleanup()
   }
 })
+
+test('安全：Content-Type 精确匹配，application/jsonp 不放行', async () => {
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)] })
+  try {
+    const res = await relay.rawCall({
+      method: 'POST',
+      path: '/send',
+      headers: { ...authHeaders(relay), 'content-type': 'application/jsonp' },
+      body: JSON.stringify({ workspace: WS, text: 'x' }),
+    })
+    assert.equal(res.status, 415)
+    assert.equal(JSON.parse(res.body).error.code, 'unsupported-media-type')
+    assert.equal(relay.state.promptCalls.length, 0)
+
+    // 带 charset 参数仍应放行
+    const ok = await relay.rawCall({
+      method: 'POST',
+      path: '/send',
+      headers: { ...authHeaders(relay), 'content-type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ workspace: WS, text: 'x' }),
+    })
+    assert.equal(ok.status, 202)
+  } finally {
+    relay.close()
+    await relay.cleanup()
+  }
+})
+
+test('安全：已存在的宽权限令牌文件会被收紧到 600', async () => {
+  const root = await tempDir()
+  const relayDir = path.join(root, 'relay')
+  const dataDir = path.join(relayDir, 'tasks')
+  const tokenPath = path.join(relayDir, 'token')
+  await fs.mkdir(relayDir, { recursive: true })
+  await fs.writeFile(tokenPath, 'a'.repeat(64) + '\n', { mode: 0o644 })
+  await fs.chmod(tokenPath, 0o644)
+  assert.equal((await fs.stat(tokenPath)).mode & 0o777, 0o644)
+
+  const relay = await startRelay({ rows: [mainRow('session-main', WS)], dataDir, token: null })
+  try {
+    assert.equal((await fs.stat(tokenPath)).mode & 0o777, 0o600, '启动后应收紧为 600')
+    const ok = await relay.rawCall({ path: '/tasks', headers: { authorization: `Bearer ${'a'.repeat(64)}` } })
+    assert.equal(ok.status, 200, '原令牌应继续可用')
+  } finally {
+    relay.close()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})

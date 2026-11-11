@@ -12,14 +12,14 @@
 import { createServer } from 'node:http'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { promises as fs, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { promises as fs, chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-const VERSION = '0.6.1'
+const VERSION = '0.6.2'
 const NAME = 'dsh-task-dispatch'
 const MAX_BODY_BYTES = 1024 * 1024
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost'])
@@ -140,7 +140,18 @@ export function apply(ctx, config = {}) {
     if (allowAnonymous) return undefined
     try {
       const existing = readFileSync(tokenFile, 'utf8').trim()
-      if (existing !== '') return existing
+      if (existing !== '') {
+        // 已有文件可能由更早的版本或手工创建，权限过宽就收紧
+        try {
+          if ((statSync(tokenFile).mode & 0o077) !== 0) {
+            chmodSync(tokenFile, 0o600)
+            console.warn(`[${NAME}] 令牌文件权限过宽，已收紧为 600: ${tokenFile}`)
+          }
+        } catch {
+          // 收紧失败不影响使用，但保持可见
+        }
+        return existing
+      }
     } catch {
       // 文件不存在，继续生成
     }
@@ -220,7 +231,9 @@ export function apply(ctx, config = {}) {
   function contentTypeAllowed(req) {
     if (req.method !== 'POST') return true
     const raw = req.headers['content-type']
-    return typeof raw === 'string' && raw.toLowerCase().startsWith('application/json')
+    if (typeof raw !== 'string') return false
+    // 精确匹配媒体类型，忽略 charset 等参数；application/jsonp 之类不放行
+    return raw.split(';')[0].trim().toLowerCase() === 'application/json'
   }
 
   function archivedIds() {
