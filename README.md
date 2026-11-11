@@ -32,8 +32,11 @@ Codex then gets `dsh_send` / `dsh_ask` / `dsh_result` / `dsh_wait` / `dsh_tasks`
 **Not published to npm yet.** Install from GitHub:
 
 ```bash
-# Option 1: the packed artifact from a release (recommended)
-dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.2/dsh-task-dispatch-0.6.2.tgz
+# Option 1: the packed artifact from a release (recommended; always the latest stable)
+dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/latest/download/dsh-task-dispatch.tgz
+
+# Pin a specific version instead with the versioned asset name
+# dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.2/dsh-task-dispatch-0.6.2.tgz
 
 # Option 2: straight from git (pulls mcp/ and test/ too)
 dsh plugin --profile desktop add github:vinson1101/dsh-task-dispatch

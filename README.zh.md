@@ -32,8 +32,11 @@ codex mcp list
 **尚未发布到 npm**，从 GitHub 安装：
 
 ```bash
-# 方式一：release 里的打包文件（推荐，等价于正式包）
-dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.2/dsh-task-dispatch-0.6.2.tgz
+# 方式一：release 里的打包文件（推荐，等价于正式包；始终指向最新正式版）
+dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/latest/download/dsh-task-dispatch.tgz
+
+# 需要固定版本时，换成带版本号的资产名
+# dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.2/dsh-task-dispatch-0.6.2.tgz
 
 # 方式二：直接从 git 仓库安装（会带上 mcp/ 和 test/，体积略大）
 dsh plugin --profile desktop add github:vinson1101/dsh-task-dispatch
