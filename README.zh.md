@@ -19,7 +19,8 @@
 插件只提供 HTTP 接口。要让 Codex 直接当工具调用，用仓库内的 `mcp/` 适配层：
 
 ```bash
-codex mcp add dsh -- node /绝对路径/dsh-task-dispatch/mcp/index.mjs
+# 适配层就在已安装的插件目录里，和插件同版本、一起升级
+codex mcp add dsh -- node ~/.dsh/profiles/desktop/node_modules/dsh-task-dispatch/mcp/index.mjs
 codex mcp list
 ```
 
@@ -36,9 +37,9 @@ codex mcp list
 dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/latest/download/dsh-task-dispatch.tgz
 
 # 需要固定版本时，换成带版本号的资产名
-# dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.2/dsh-task-dispatch-0.6.2.tgz
+# dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.3/dsh-task-dispatch-0.6.3.tgz
 
-# 方式二：直接从 git 仓库安装（会带上 mcp/ 和 test/，体积略大）
+# 方式二：直接从 git 仓库安装（同样包含 mcp/；不含 test/）
 dsh plugin --profile desktop add github:vinson1101/dsh-task-dispatch
 
 # 方式三：本地目录（开发时，软链，改代码即时生效）

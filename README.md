@@ -19,7 +19,8 @@ This plugin deliberately declares no host packages, so that class of conflict ca
 The plugin only speaks HTTP. To expose it as Codex tools, use the bundled `mcp/` adapter:
 
 ```bash
-codex mcp add dsh -- node /absolute/path/dsh-task-dispatch/mcp/index.mjs
+# the adapter ships inside the installed plugin, so both stay on one version
+codex mcp add dsh -- node ~/.dsh/profiles/desktop/node_modules/dsh-task-dispatch/mcp/index.mjs
 codex mcp list
 ```
 
@@ -36,9 +37,9 @@ Codex then gets `dsh_send` / `dsh_ask` / `dsh_result` / `dsh_wait` / `dsh_tasks`
 dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/latest/download/dsh-task-dispatch.tgz
 
 # Pin a specific version instead with the versioned asset name
-# dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.2/dsh-task-dispatch-0.6.2.tgz
+# dsh plugin --profile desktop add https://github.com/vinson1101/dsh-task-dispatch/releases/download/v0.6.3/dsh-task-dispatch-0.6.3.tgz
 
-# Option 2: straight from git (pulls mcp/ and test/ too)
+# Option 2: straight from git (includes mcp/ as well; test/ is not packed)
 dsh plugin --profile desktop add github:vinson1101/dsh-task-dispatch
 
 # Option 3: a local directory (development; symlinked, edits apply immediately)

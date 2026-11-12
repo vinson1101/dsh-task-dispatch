@@ -1,6 +1,6 @@
 {
   "name": "dsh-task-dispatch",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "按工作空间给真实的 DSH 会话派发任务，带持久任务台账、只读结果查询与等待，零依赖",
   "type": "module",
   "license": "MIT",
@@ -17,6 +17,7 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
+    "mcp",
     "README.md",
     "README.zh.md",
     "LICENSE"
@@ -42,5 +43,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "bin": {
+    "dsh-task-dispatch-mcp": "./mcp/index.mjs"
   }
 }

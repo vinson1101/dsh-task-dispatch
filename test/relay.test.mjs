@@ -745,3 +745,11 @@ test('安全：已存在的宽权限令牌文件会被收紧到 600', async () =
     await fs.rm(root, { recursive: true, force: true })
   }
 })
+
+test('打包：mcp 适配层随包分发（防止再次漏掉）', async () => {
+  const pkg = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.ok(pkg.files.includes('mcp'), 'package.json 的 files 必须包含 mcp')
+  assert.equal(pkg.bin?.['dsh-task-dispatch-mcp'], './mcp/index.mjs', '必须暴露 mcp 的 bin')
+  const adapter = await fs.stat(new URL('../mcp/index.mjs', import.meta.url))
+  assert.ok(adapter.isFile(), 'mcp/index.mjs 必须存在')
+})
