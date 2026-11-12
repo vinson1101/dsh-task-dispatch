@@ -46,5 +46,13 @@
   },
   "bin": {
     "dsh-task-dispatch-mcp": "./mcp/index.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vinson1101/dsh-task-dispatch.git"
+  },
+  "homepage": "https://github.com/vinson1101/dsh-task-dispatch#readme",
+  "bugs": {
+    "url": "https://github.com/vinson1101/dsh-task-dispatch/issues"
   }
 }
